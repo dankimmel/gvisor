@@ -364,6 +364,156 @@ func TestHostConnectionConcurrent(t *testing.T) {
 	}
 }
 
+// drainServer reads count requests from serverFD and discards them without
+// ever writing a reply. It signals completion on done. Used to model a server
+// receiving no-reply requests (e.g. FUSE_FORGET).
+func drainServer(t *testing.T, serverFD int, count int, done chan struct{}) {
+	t.Helper()
+	defer close(done)
+
+	buf := make([]byte, linux.FUSE_MIN_READ_BUFFER)
+	for i := 0; i < count; i++ {
+		if _, err := unix.Read(serverFD, buf); err != nil {
+			t.Errorf("drainServer Read %d: %v", i, err)
+			return
+		}
+	}
+}
+
+// forgetAwareServer reads count requests from serverFD. It echoes a reply for
+// any request whose opcode is not FUSE_FORGET, and silently drains (never
+// replies to) FUSE_FORGET requests. It signals completion on done.
+func forgetAwareServer(t *testing.T, serverFD int, count int, done chan struct{}) {
+	t.Helper()
+	defer close(done)
+
+	buf := make([]byte, linux.FUSE_MIN_READ_BUFFER)
+	for i := 0; i < count; i++ {
+		n, err := unix.Read(serverFD, buf)
+		if err != nil {
+			t.Errorf("forgetAwareServer Read %d: %v", i, err)
+			return
+		}
+		if n < int(linux.SizeOfFUSEHeaderIn) {
+			t.Errorf("forgetAwareServer: short read %d bytes on request %d", n, i)
+			return
+		}
+
+		var reqHdr linux.FUSEHeaderIn
+		reqHdr.UnmarshalUnsafe(buf[:linux.SizeOfFUSEHeaderIn])
+		if reqHdr.Opcode == linux.FUSE_FORGET {
+			// No reply for FUSE_FORGET.
+			continue
+		}
+
+		payload := buf[linux.SizeOfFUSEHeaderIn:n]
+		respLen := linux.SizeOfFUSEHeaderOut + uint32(len(payload))
+		respBuf := make([]byte, respLen)
+		respHdr := linux.FUSEHeaderOut{
+			Len:    respLen,
+			Error:  0,
+			Unique: reqHdr.Unique,
+		}
+		respHdr.MarshalUnsafe(respBuf[:linux.SizeOfFUSEHeaderOut])
+		copy(respBuf[linux.SizeOfFUSEHeaderOut:], payload)
+		if _, err := unix.Write(serverFD, respBuf); err != nil {
+			t.Errorf("forgetAwareServer Write %d: %v", i, err)
+			return
+		}
+	}
+}
+
+// activeRequestState reads the connection's completion-map size and active
+// request count under conn.mu.
+func activeRequestState(hc *hostConnection) (numCompletions int, numActive uint64) {
+	hc.conn.mu.Lock()
+	defer hc.conn.mu.Unlock()
+	return len(hc.conn.completions), hc.conn.numActiveRequests
+}
+
+// TestHostConnectionNoReplyDoesNotLeak verifies that no-reply requests
+// (e.g. FUSE_FORGET) sent over the host FD do not permanently occupy a
+// completion-map entry or an active-request slot. Such requests never receive
+// a reply, so if call() registered a completion for them it would leak.
+func TestHostConnectionNoReplyDoesNotLeak(t *testing.T) {
+	s := setup(t)
+	defer s.Destroy()
+
+	hc, serverFD, cleanup := newTestHostConnection(t)
+	defer cleanup()
+
+	const numForgets = 5
+	done := make(chan struct{})
+	go drainServer(t, serverFD, numForgets, done)
+
+	creds := auth.CredentialsFromContext(s.Ctx)
+	for i := 0; i < numForgets; i++ {
+		payload := primitive.Uint32(uint32(i))
+		req := hc.conn.NewRequest(creds, 1, uint64(i), linux.FUSE_FORGET, &payload)
+		req.noReply = true
+		if err := hc.CallAsync(s.Ctx, req); err != nil {
+			t.Fatalf("CallAsync forget %d: %v", i, err)
+		}
+	}
+
+	<-done
+
+	if nComp, nActive := activeRequestState(hc); nComp != 0 || nActive != 0 {
+		t.Errorf("no-reply requests leaked state: completions=%d, numActiveRequests=%d; want 0, 0", nComp, nActive)
+	}
+}
+
+// TestHostConnectionNoReplyInterleaved verifies that a normal reply-bearing
+// request interleaved between no-reply requests still completes correctly, and
+// that the connection's accounting settles back to zero afterwards.
+func TestHostConnectionNoReplyInterleaved(t *testing.T) {
+	s := setup(t)
+	defer s.Destroy()
+
+	hc, serverFD, cleanup := newTestHostConnection(t)
+	defer cleanup()
+
+	// Three requests on the wire: forget, echo, forget.
+	done := make(chan struct{})
+	go forgetAwareServer(t, serverFD, 3, done)
+
+	creds := auth.CredentialsFromContext(s.Ctx)
+
+	forget1Payload := primitive.Uint32(1)
+	forget1 := hc.conn.NewRequest(creds, 1, 1, linux.FUSE_FORGET, &forget1Payload)
+	forget1.noReply = true
+	if err := hc.CallAsync(s.Ctx, forget1); err != nil {
+		t.Fatalf("CallAsync forget1: %v", err)
+	}
+
+	echoPayload := primitive.Uint32(42)
+	echoReq := hc.conn.NewRequest(creds, 1, 2, echoTestOpcode, &echoPayload)
+	resp, err := hc.Call(s.Ctx, echoReq)
+	if err != nil {
+		t.Fatalf("Call echo: %v", err)
+	}
+	var got primitive.Uint32
+	if err := resp.UnmarshalPayload(&got); err != nil {
+		t.Fatalf("UnmarshalPayload: %v", err)
+	}
+	if got != echoPayload {
+		t.Fatalf("echo payload: got %d, want %d", got, echoPayload)
+	}
+
+	forget2Payload := primitive.Uint32(2)
+	forget2 := hc.conn.NewRequest(creds, 1, 3, linux.FUSE_FORGET, &forget2Payload)
+	forget2.noReply = true
+	if err := hc.CallAsync(s.Ctx, forget2); err != nil {
+		t.Fatalf("CallAsync forget2: %v", err)
+	}
+
+	<-done
+
+	if nComp, nActive := activeRequestState(hc); nComp != 0 || nActive != 0 {
+		t.Errorf("interleaved no-reply leaked state: completions=%d, numActiveRequests=%d; want 0, 0", nComp, nActive)
+	}
+}
+
 func TestHostConnectionNotConnected(t *testing.T) {
 	s := setup(t)
 	defer s.Destroy()
