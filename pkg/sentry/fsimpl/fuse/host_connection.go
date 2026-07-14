@@ -281,6 +281,11 @@ func (hc *hostConnection) dispatchReply(hdr linux.FUSEHeaderOut, pb *pooledBuf) 
 func (hc *hostConnection) abortPending() {
 	hc.conn.mu.Lock()
 	defer hc.conn.mu.Unlock()
+	if !hc.conn.connected {
+		// Already torn down (e.g. by conn.Abort). Avoid double-closing
+		// fullQueueCh.
+		return
+	}
 	hc.conn.connected = false
 	for id, fut := range hc.conn.completions {
 		delete(hc.conn.completions, id)
@@ -294,6 +299,10 @@ func (hc *hostConnection) abortPending() {
 		}
 		close(fut.ch)
 	}
+	// Wake all admission waiters so they observe !connected and return
+	// ECONNABORTED. Closing is safe: completions are drained and connected is
+	// false, so no code path sends to fullQueueCh after this.
+	close(hc.conn.fullQueueCh)
 }
 
 // call implements fuseConn.call. It registers a futureResponse, writes the
@@ -319,6 +328,12 @@ func (hc *hostConnection) call(ctx context.Context, r *Request) (*Response, erro
 		return nil, nil
 	}
 
+	// Admission control (blocking-guest): wait for a free slot before
+	// registering. noReply requests above bypass this entirely.
+	if err := hc.conn.waitForSlot(ctx); err != nil {
+		hc.conn.mu.Unlock()
+		return nil, err
+	}
 	hc.conn.numActiveRequests++
 	fut := newFutureResponse(r)
 	hc.conn.completions[r.id] = fut
@@ -326,13 +341,56 @@ func (hc *hostConnection) call(ctx context.Context, r *Request) (*Response, erro
 
 	if err := hc.writeRequest(r); err != nil {
 		hc.conn.mu.Lock()
-		delete(hc.conn.completions, r.id)
-		hc.conn.numActiveRequests--
+		if _, ok := hc.conn.completions[r.id]; ok {
+			delete(hc.conn.completions, r.id)
+			hc.conn.numActiveRequests--
+			hc.signalSlotLocked()
+		}
 		hc.conn.mu.Unlock()
 		return nil, err
 	}
 
-	return fut.resolve(ctx)
+	res, err := fut.resolve(ctx)
+	if err != nil {
+		// The task was interrupted before the reply completed. Encode the
+		// interruption ownership rule: the reader is the sole owner of a reply
+		// buffer until it transfers to a live future; an abandoned future never
+		// keeps a buffer.
+		hc.conn.mu.Lock()
+		if _, ok := hc.conn.completions[r.id]; ok {
+			// The reader has not dispatched a reply yet. Remove our entry and
+			// free the slot; a late reply then hits the unknown-Unique path in
+			// the reader, which releases its buffer.
+			delete(hc.conn.completions, r.id)
+			hc.conn.numActiveRequests--
+			hc.signalSlotLocked()
+			hc.conn.mu.Unlock()
+		} else {
+			// The reader already dispatched a reply to this now-abandoned future
+			// (it removed the entry and decremented the count). Release the
+			// buffer here, since the caller will not consume it.
+			pbuf := fut.pbuf
+			fut.pbuf = nil
+			hc.conn.mu.Unlock()
+			if pbuf != nil {
+				pbuf.release()
+			}
+		}
+		return nil, err
+	}
+	return res, nil
+}
+
+// signalSlotLocked wakes one admission waiter (non-blocking). Safe only when
+// fullQueueCh is open, which holds whenever a completion is present under
+// conn.mu (abortPending drains completions and closes the channel atomically).
+//
+// +checklocks:hc.conn.mu
+func (hc *hostConnection) signalSlotLocked() {
+	select {
+	case hc.conn.fullQueueCh <- struct{}{}:
+	default:
+	}
 }
 
 // Call makes a request to the server via the host FD and blocks until a

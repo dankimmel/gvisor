@@ -448,29 +448,40 @@ func (conn *connection) callFuture(b context.Blocker, r *Request) (*futureRespon
 	conn.mu.Lock()
 	defer conn.mu.Unlock()
 
-	// Is the queue full?
-	//
-	// We must busy wait here until the request can be queued. We don't
-	// block on the fd.fullQueueCh with a lock - so after being signalled,
-	// before we acquire the lock, it is possible that a barging task enters
-	// and queues a request. As a result, upon acquiring the lock we must
-	// again check if the room is available.
-	//
-	// This can potentially starve a request forever but this can only happen
-	// if there are always too many ongoing requests all the time. The
-	// supported maxActiveRequests setting should be really high to avoid this.
-	for conn.numActiveRequests == conn.maxActiveRequests {
-		log.Infof("Blocking request %v from being queued. Too many active requests: %v",
-			r.id, conn.numActiveRequests)
+	if err := conn.waitForSlot(b); err != nil {
+		return nil, err
+	}
+	return conn.callFutureLocked(r)
+}
+
+// waitForSlot blocks until an active-request slot is available, or the
+// connection is torn down (returning ECONNABORTED). It is shared by the device
+// and host transports so admission has one implementation.
+//
+// We must busy-wait: we don't hold conn.mu while blocking on fullQueueCh, so
+// after being signalled, before we re-acquire the lock, a barging task may take
+// the slot; upon re-acquiring the lock we re-check. This can starve a request
+// only if there are always too many ongoing requests, so maxActiveRequests
+// should be high enough to avoid this. conn.connected is re-checked every
+// iteration so a torn-down connection wakes waiters promptly.
+//
+// +checklocks:conn.mu
+func (conn *connection) waitForSlot(b context.Blocker) error {
+	for conn.numActiveRequests >= conn.maxActiveRequests {
+		if !conn.connected {
+			return linuxerr.ECONNABORTED
+		}
 		conn.mu.Unlock()
 		err := b.Block(conn.fullQueueCh)
 		conn.mu.Lock()
 		if err != nil {
-			return nil, err
+			return err
 		}
 	}
-
-	return conn.callFutureLocked(r)
+	if !conn.connected {
+		return linuxerr.ECONNABORTED
+	}
+	return nil
 }
 
 // callFutureLocked makes a request to the server and returns a future response.
