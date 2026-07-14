@@ -38,6 +38,32 @@ const Name = "fuse"
 // on the number of active requests at any given time.
 const maxActiveRequestsDefault = 10000
 
+// Host-FD transport memory-limit defaults and hard clamps. Mount options may
+// tune the first three within the clamps; the clamps are the Sentry-side
+// security boundary for untrusted (e.g. annotation-derived) values.
+const (
+	// fuseDefaultReplyBufMax is the default large-class reply-buffer ceiling.
+	fuseDefaultReplyBufMax = 1 << 20 // 1 MiB
+	// fuseDefaultReplyBufConcurrency is the default number of concurrent
+	// large-class reply buffers.
+	fuseDefaultReplyBufConcurrency = 16
+
+	// fuseMaxMaxInflight is the hard upper clamp on max_inflight.
+	fuseMaxMaxInflight = 65536
+	// fuseMaxReplyBuf is the hard upper clamp on reply_buf_max (large-class
+	// ceiling), in bytes.
+	fuseMaxReplyBuf = 4 << 20 // 4 MiB
+	// fuseMaxReplyBufConcurrency is the hard upper clamp on
+	// reply_buf_concurrency.
+	fuseMaxReplyBufConcurrency = 256
+	// fuseMaxMaxRead is the hard upper clamp on max_read, in bytes. It matches
+	// the largest READ the connection can request (fuseMaxMaxPages pages).
+	fuseMaxMaxRead = 1 << 20 // 1 MiB
+	// fuseMinReplyBuf is the hard lower clamp on reply_buf_max: the large class
+	// must be at least as large as the small class.
+	fuseMinReplyBuf = linux.FUSE_MIN_READ_BUFFER
+)
+
 // FilesystemType implements vfs.FilesystemType.
 //
 // +stateify savable
@@ -66,6 +92,19 @@ type filesystemOptions struct {
 	// specified as "max_read" in fs parameters.
 	// If not specified by user, use math.MaxUint32 as default value.
 	maxRead uint32
+
+	// maxInflight is the maximum number of in-flight requests for a host-FD
+	// mount, specified as "max_inflight". For host-FD mounts it replaces
+	// maxActiveRequests; the device path is unaffected.
+	maxInflight uint64
+
+	// replyBufMax is the large-class reply-buffer ceiling in bytes for a host-FD
+	// mount, specified as "reply_buf_max".
+	replyBufMax uint32
+
+	// replyBufConcurrency is the maximum number of concurrent large-class reply
+	// buffers for a host-FD mount, specified as "reply_buf_concurrency".
+	replyBufConcurrency uint32
 
 	// defaultPermissions is the default_permissions mount option. It instructs
 	// the kernel to perform a standard unix permission checks based on
@@ -340,6 +379,15 @@ func parseOptions(ctx context.Context, creds *auth.Credentials, data string) (*f
 	}
 
 	return fsopts, int32(deviceDescriptor), nil
+}
+
+// clampHostFDOptions applies the host-FD-specific clamps to fsopts: the upper
+// bound on max_read and the coupling rule tying max_read to reply_buf_max. It is
+// applied only when building a host-FD connection, so the device path's max_read
+// behavior is unchanged.
+//
+// TODO: implemented in the following commit.
+func clampHostFDOptions(ctx context.Context, fsopts *filesystemOptions) {
 }
 
 // newFUSEFilesystem creates a new FUSE filesystem.
