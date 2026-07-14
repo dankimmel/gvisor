@@ -76,6 +76,56 @@ func TestFromFlags(t *testing.T) {
 	}
 }
 
+func TestFUSEFlags(t *testing.T) {
+	testFlags := flag.NewFlagSet("test", flag.ContinueOnError)
+	RegisterFlags(testFlags)
+	for name, val := range map[string]string{
+		"fuse-max-inflight":          "512",
+		"fuse-reply-buf-max":         "262144",
+		"fuse-reply-buf-concurrency": "8",
+		"fuse-allowed-socket-dirs":   "/run/fuse,/var/run/fuse",
+	} {
+		if err := testFlags.Lookup(name).Value.Set(val); err != nil {
+			t.Fatalf("set %q: %v", name, err)
+		}
+	}
+	c, err := NewFromFlags(testFlags)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := c.FUSEMaxInflight, uint64(512); got != want {
+		t.Errorf("FUSEMaxInflight=%d, want %d", got, want)
+	}
+	if got, want := c.FUSEReplyBufMax, uint64(262144); got != want {
+		t.Errorf("FUSEReplyBufMax=%d, want %d", got, want)
+	}
+	if got, want := c.FUSEReplyBufConcurrency, uint64(8); got != want {
+		t.Errorf("FUSEReplyBufConcurrency=%d, want %d", got, want)
+	}
+	if got, want := c.FUSEAllowedSocketDirs, "/run/fuse,/var/run/fuse"; got != want {
+		t.Errorf("FUSEAllowedSocketDirs=%q, want %q", got, want)
+	}
+
+	// The four flags must round-trip back out through ToFlags.
+	fm := map[string]string{}
+	for _, f := range c.ToFlags() {
+		kv := strings.SplitN(strings.TrimPrefix(f, "--"), "=", 2)
+		fm[kv[0]] = kv[1]
+	}
+	for name, want := range map[string]string{
+		"fuse-max-inflight":          "512",
+		"fuse-reply-buf-max":         "262144",
+		"fuse-reply-buf-concurrency": "8",
+		"fuse-allowed-socket-dirs":   "/run/fuse,/var/run/fuse",
+	} {
+		if got, ok := fm[name]; !ok {
+			t.Errorf("flag %q not emitted by ToFlags", name)
+		} else if got != want {
+			t.Errorf("ToFlags %q=%q, want %q", name, got, want)
+		}
+	}
+}
+
 func TestToFlagsFromFlags(t *testing.T) {
 	testFlags := flag.NewFlagSet("test", flag.ContinueOnError)
 	RegisterFlags(testFlags)

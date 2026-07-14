@@ -47,6 +47,17 @@ const (
 	flagQDisc                   = "qdisc"
 	flagQDiscTBFRate            = "qdisc-tbf-rate"
 	flagQDiscTBFBurst           = "qdisc-tbf-burst"
+	flagFUSEMaxInflight         = "fuse-max-inflight"
+	flagFUSEReplyBufMax         = "fuse-reply-buf-max"
+	flagFUSEReplyBufConcurrency = "fuse-reply-buf-concurrency"
+	flagFUSEAllowedSocketDirs   = "fuse-allowed-socket-dirs"
+
+	// Defaults for the host-FD FUSE tuning flags. They must stay within the
+	// Sentry-side hard clamps (see pkg/sentry/fsimpl/fuse); the Sentry re-clamps
+	// regardless, so these are convenience defaults only.
+	defaultFUSEMaxInflight         = uint64(10000)
+	defaultFUSEReplyBufMax         = uint64(1 << 20)
+	defaultFUSEReplyBufConcurrency = uint64(16)
 
 	maxQDiscTBFBurst     = uint64(1<<32 - 1)
 	defaultQDiscTBFRate  = uint64(0)
@@ -148,6 +159,10 @@ func RegisterFlags(flagSet *flag.FlagSet) {
 	flagSet.Int("dcache", -1, "Set the global dentry cache size. This acts as a coarse-grained control on the number of host FDs simultaneously open by the sentry. If negative, per-mount caches are used.")
 	flagSet.Bool("iouring", false, "TEST ONLY; Enables io_uring syscalls in the sentry. Support is experimental and very limited.")
 	flagSet.Bool("directfs", true, "directly access the container filesystems from the sentry. Sentry runs with higher privileges.")
+	flagSet.Uint64(flagFUSEMaxInflight, defaultFUSEMaxInflight, "default maximum number of in-flight requests for host-FD FUSE mounts. Clamped Sentry-side; may be overridden per-container or per-mount.")
+	flagSet.Uint64(flagFUSEReplyBufMax, defaultFUSEReplyBufMax, "default large-class reply-buffer ceiling in bytes for host-FD FUSE mounts. Clamped Sentry-side.")
+	flagSet.Uint64(flagFUSEReplyBufConcurrency, defaultFUSEReplyBufConcurrency, "default maximum number of concurrent large-class reply buffers for host-FD FUSE mounts. Clamped Sentry-side.")
+	flagSet.String(flagFUSEAllowedSocketDirs, "", "comma-separated list of host directories under which a host-FD FUSE backend's Unix-domain-socket source path must reside. Empty disables runsc-provisioned host-FD FUSE mounts.")
 	flagSet.Bool("TESTONLY-nftables", false, "TEST ONLY; Enables nftables support in the sentry.")
 
 	// Flags that control sandbox runtime behavior: network related.

@@ -339,6 +339,24 @@ type Config struct {
 	// exists, but is mostly idle. Not supported in rootless mode.
 	DirectFS bool `flag:"directfs"`
 
+	// FUSEMaxInflight is the default maximum number of in-flight requests for
+	// host-FD FUSE mounts. A per-container annotation or per-mount option may
+	// override it, bounded by the Sentry-side hard clamp.
+	FUSEMaxInflight uint64 `flag:"fuse-max-inflight"`
+
+	// FUSEReplyBufMax is the default large-class reply-buffer ceiling in bytes
+	// for host-FD FUSE mounts.
+	FUSEReplyBufMax uint64 `flag:"fuse-reply-buf-max"`
+
+	// FUSEReplyBufConcurrency is the default maximum number of concurrent
+	// large-class reply buffers for host-FD FUSE mounts.
+	FUSEReplyBufConcurrency uint64 `flag:"fuse-reply-buf-concurrency"`
+
+	// FUSEAllowedSocketDirs is a comma-separated list of host directories under
+	// which a host-FD FUSE mount's backend Unix-domain-socket source path must
+	// reside. Empty disables runsc-provisioned host-FD FUSE mounts.
+	FUSEAllowedSocketDirs string `flag:"fuse-allowed-socket-dirs"`
+
 	// AppHugePages enables support for application huge pages.
 	AppHugePages bool `flag:"app-huge-pages"`
 
