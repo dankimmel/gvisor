@@ -61,6 +61,10 @@ type hostConnection struct {
 	// coalesced read). It is owned exclusively by the reader goroutine (and by
 	// InitSend before the reader is started), so it needs no lock.
 	readBuf []byte
+
+	// pool provides the size-classed reply buffers and the large-class gate for
+	// this connection's replies.
+	pool *bufferPool
 }
 
 // newHostConnection creates a hostConnection that communicates over hostFD.
@@ -68,6 +72,7 @@ func newHostConnection(conn *connection, hostFD int32) *hostConnection {
 	return &hostConnection{
 		conn:   conn,
 		hostFD: hostFD,
+		pool:   newBufferPool(conn.replyBufMax, conn.replyBufConcurrency),
 	}
 }
 
@@ -122,7 +127,7 @@ func (hc *hostConnection) fillReadBuf() error {
 // On an invalid Len it returns errBadFrame; the caller must tear the connection
 // down rather than attempt to resync, as FUSE stream framing has no resync
 // point.
-func (hc *hostConnection) readFrame() (linux.FUSEHeaderOut, []byte, error) {
+func (hc *hostConnection) readFrame() (linux.FUSEHeaderOut, *pooledBuf, error) {
 	// Ensure the fixed-size header is fully buffered.
 	for uint32(len(hc.readBuf)) < linux.SizeOfFUSEHeaderOut {
 		if err := hc.fillReadBuf(); err != nil {
@@ -138,10 +143,13 @@ func (hc *hostConnection) readFrame() (linux.FUSEHeaderOut, []byte, error) {
 	}
 	frameLen := int(hdr.Len)
 
+	// Acquire a pooled buffer sized to the frame. From here on, every error path
+	// must release it (returning the large-class gate permit, if any).
+	pb := hc.pool.get(frameLen)
+	n := copy(pb.bytes, hc.readBuf)
+
 	if len(hc.readBuf) >= frameLen {
-		// The whole frame (and possibly the start of the next) is buffered.
-		buf := make([]byte, frameLen)
-		copy(buf, hc.readBuf)
+		// The whole frame (and possibly the start of the next) was buffered.
 		if leftover := len(hc.readBuf) - frameLen; leftover > 0 {
 			rem := make([]byte, leftover)
 			copy(rem, hc.readBuf[frameLen:])
@@ -149,26 +157,26 @@ func (hc *hostConnection) readFrame() (linux.FUSEHeaderOut, []byte, error) {
 		} else {
 			hc.readBuf = hc.readBuf[:0]
 		}
-		return hdr, buf, nil
+		return hdr, pb, nil
 	}
 
 	// Only part of the frame is buffered. Read the remainder directly into the
 	// frame buffer, bounded by frameLen so we never over-read into the next
 	// frame.
-	buf := make([]byte, frameLen)
-	n := copy(buf, hc.readBuf)
 	hc.readBuf = hc.readBuf[:0]
 	for n < frameLen {
-		r, err := readFD(int(hc.hostFD), buf[n:])
+		r, err := readFD(int(hc.hostFD), pb.bytes[n:])
 		if err != nil {
+			pb.release()
 			return hdr, nil, err
 		}
 		if r == 0 {
+			pb.release()
 			return hdr, nil, errReaderClosed
 		}
 		n += r
 	}
-	return hdr, buf, nil
+	return hdr, pb, nil
 }
 
 // readLoop reads FUSE reply frames from the host FD and dispatches them to the
@@ -176,7 +184,7 @@ func (hc *hostConnection) readFrame() (linux.FUSEHeaderOut, []byte, error) {
 // the connection down) on any read error or an invalid frame.
 func (hc *hostConnection) readLoop() {
 	for {
-		hdr, buf, err := hc.readFrame()
+		hdr, pb, err := hc.readFrame()
 		if err != nil {
 			if errors.Is(err, errBadFrame) {
 				log.Warningf("fuse host connection: invalid frame length %d (max %d); tearing down connection", hdr.Len, hc.maxFrame())
@@ -186,13 +194,15 @@ func (hc *hostConnection) readLoop() {
 			hc.abortPending()
 			return
 		}
-		hc.dispatchReply(hdr, buf)
+		hc.dispatchReply(hdr, pb)
 	}
 }
 
-// dispatchReply routes a single framed reply to its waiting caller. Buffer
-// ownership transfers to the future; no payload is copied under conn.mu.
-func (hc *hostConnection) dispatchReply(hdr linux.FUSEHeaderOut, buf []byte) {
+// dispatchReply routes a single framed reply to its waiting caller. On a match,
+// buffer ownership transfers to the future (and later to the opcode handler);
+// otherwise the reader releases the buffer itself. No payload is copied under
+// conn.mu.
+func (hc *hostConnection) dispatchReply(hdr linux.FUSEHeaderOut, pb *pooledBuf) {
 	// Server-initiated notifications are NOT supported on the host-FD path.
 	//
 	// A FUSE server may send unsolicited notifications, identified by a header
@@ -223,6 +233,7 @@ func (hc *hostConnection) dispatchReply(hdr linux.FUSEHeaderOut, buf []byte) {
 	// that reply is correlated by the server rather than the client.
 	if hdr.Unique == 0 {
 		log.Warningf("fuse host connection: discarding unsupported server notification (code %d)", hdr.Error)
+		pb.release()
 		return
 	}
 
@@ -231,13 +242,24 @@ func (hc *hostConnection) dispatchReply(hdr linux.FUSEHeaderOut, buf []byte) {
 	if !ok {
 		hc.conn.mu.Unlock()
 		// A late reply for a request that was canceled/interrupted and already
-		// removed from the map. Drop it.
+		// removed from the map. Drop it. This is the path that reclaims the
+		// buffer and permit for an interrupted caller's late reply.
 		log.Debugf("fuse host connection: dropping reply for unknown request %d", hdr.Unique)
+		pb.release()
 		return
 	}
 	delete(hc.conn.completions, hdr.Unique)
 	fut.hdr = &hdr
-	fut.data = buf
+	// Async (fire-and-forget) callers never consume the reply — resolve() has
+	// already returned to them — so the reply buffer is discarded here rather
+	// than transferred. Sync callers take ownership via the future.
+	var toRelease *pooledBuf
+	if fut.async {
+		toRelease = pb
+	} else {
+		fut.pbuf = pb
+		fut.data = pb.bytes
+	}
 	select {
 	case hc.conn.fullQueueCh <- struct{}{}:
 	default:
@@ -245,6 +267,12 @@ func (hc *hostConnection) dispatchReply(hdr linux.FUSEHeaderOut, buf []byte) {
 	hc.conn.numActiveRequests--
 	close(fut.ch)
 	hc.conn.mu.Unlock()
+
+	// Release outside the lock to keep the completion hot path allocation- and
+	// pool-op-free under conn.mu.
+	if toRelease != nil {
+		toRelease.release()
+	}
 }
 
 // abortPending tears the connection down and wakes all callers blocked on a
@@ -381,24 +409,30 @@ func (hc *hostConnection) InitSend(creds *auth.Credentials, pid uint32, hasSysAd
 
 	// Read the INIT reply through the same framer the reader goroutine uses, so
 	// there is a single wire parser. INIT replies fit the small class.
-	hdr, buf, err := hc.readFrame()
+	hdr, pb, err := hc.readFrame()
 	if err != nil {
 		return err
 	}
 	if hdr.Unique != req.hdr.Unique {
 		log.Warningf("fuse host connection: unexpected reply during INIT (unique %d, want %d)", hdr.Unique, req.hdr.Unique)
+		pb.release()
 		return linuxerr.EIO
 	}
 
 	res := &Response{
 		opcode: linux.FUSE_INIT,
 		hdr:    hdr,
-		data:   buf,
+		data:   pb.bytes,
+		pbuf:   pb,
 	}
 
 	hc.conn.mu.Lock()
-	defer hc.conn.mu.Unlock()
-	if err := hc.conn.InitRecv(res, hasSysAdminCap); err != nil {
+	err = hc.conn.InitRecv(res, hasSysAdminCap)
+	hc.conn.mu.Unlock()
+
+	// The INIT reply has been consumed; return its buffer to the pool.
+	res.Release()
+	if err != nil {
 		return err
 	}
 

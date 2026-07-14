@@ -145,9 +145,11 @@ type futureResponse struct {
 	// If this request is async.
 	async bool
 
-	// buf is a fixed-size buffer for response data. The host connection
-	// path slices data from this buffer to avoid a per-response allocation.
-	buf [linux.FUSE_MIN_READ_BUFFER]byte
+	// pbuf is the pooled reply buffer backing data on the host-FD path; nil on
+	// the device path. Ownership transfers from the reader to this future and
+	// then to the opcode handler, which releases it. Transient reply state, not
+	// saved.
+	pbuf *pooledBuf `state:"nosave"`
 }
 
 // newFutureResponse creates a future response to a FUSE request.
@@ -174,12 +176,14 @@ func (f *futureResponse) resolve(b context.Blocker) (*Response, error) {
 	return f.getResponse(), nil
 }
 
-// getResponse creates a Response from the data the futureResponse has.
+// getResponse creates a Response from the data the futureResponse has. Buffer
+// ownership (pbuf) transfers to the returned Response.
 func (f *futureResponse) getResponse() *Response {
 	return &Response{
 		opcode: f.opcode,
 		hdr:    *f.hdr,
 		data:   f.data,
+		pbuf:   f.pbuf,
 	}
 }
 
@@ -191,6 +195,22 @@ type Response struct {
 	opcode linux.FUSEOpcode
 	hdr    linux.FUSEHeaderOut
 	data   []byte
+
+	// pbuf is the pooled reply buffer backing data on the host-FD path; nil on
+	// the device path (where Release is a no-op). Transient, not saved.
+	pbuf *pooledBuf `state:"nosave"`
+}
+
+// Release returns the reply buffer backing r to its pool. It is idempotent and
+// a no-op for responses not backed by a pooled buffer (the device path). Opcode
+// handlers must call Release after their last use of r.data, on every exit path
+// including error-only replies. For a READ whose payload slice escapes the
+// handler, release at the copy-out point instead.
+func (r *Response) Release() {
+	if r.pbuf != nil {
+		r.pbuf.release()
+		r.pbuf = nil
+	}
 }
 
 // Error returns the error of the FUSE call.

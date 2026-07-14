@@ -200,6 +200,7 @@ func TestHostFramerHeaderSplit(t *testing.T) {
 			if got != payload {
 				t.Fatalf("payload: got %#x, want %#x", uint32(got), uint32(payload))
 			}
+			resp.Release()
 		})
 	}
 }
@@ -251,6 +252,7 @@ func TestHostFramerPayloadSplit(t *testing.T) {
 			t.Fatalf("word %d: got %d, want %d", i, uint32(got), i)
 		}
 	}
+	resp.Release()
 }
 
 func TestHostFramerCoalescedReplies(t *testing.T) {
@@ -289,6 +291,7 @@ func TestHostFramerCoalescedReplies(t *testing.T) {
 				} else if uint32(got) != uint32(100+i) {
 					err = fmt.Errorf("payload got %d, want %d", uint32(got), 100+i)
 				}
+				resp.Release()
 			}
 			results <- callResult{resp, err}
 		}(i)
@@ -357,6 +360,7 @@ func TestHostFramerReadaheadRemainder(t *testing.T) {
 			if got != want {
 				t.Errorf("%s payload: got %d, want %d", name, uint32(got), uint32(want))
 			}
+			res.resp.Release()
 		case <-time.After(5 * time.Second):
 			t.Fatalf("%s Call did not return", name)
 		}
@@ -397,6 +401,7 @@ func TestHostFramerNotificationDiscarded(t *testing.T) {
 	if got != p {
 		t.Fatalf("payload: got %d, want %d", uint32(got), uint32(p))
 	}
+	resp.Release()
 }
 
 func TestHostFramerUnknownUniqueDropped(t *testing.T) {
@@ -428,6 +433,7 @@ func TestHostFramerUnknownUniqueDropped(t *testing.T) {
 	if got != p {
 		t.Fatalf("payload: got %d, want %d", uint32(got), uint32(p))
 	}
+	resp.Release()
 	// The stray reply must not have torn down the connection.
 	hc.conn.mu.Lock()
 	connected := hc.conn.connected
@@ -472,6 +478,12 @@ func TestHostFramerLargeReply(t *testing.T) {
 			t.Fatalf("payload byte %d: got %d, want %d", i, data[i], byte(i))
 		}
 	}
+	resp.Release()
+
+	// Releasing a large reply must return its gate permit and balance the pool.
+	if !hc.pool.balanced() {
+		t.Errorf("buffer pool not balanced after large reply Release")
+	}
 }
 
 func TestHostFramerInvalidLenTearsDown(t *testing.T) {
@@ -504,6 +516,7 @@ func TestHostFramerInvalidLenTearsDown(t *testing.T) {
 				if resp == nil || !linuxerr.Equals(linuxerr.ECONNABORTED, resp.Error()) {
 					t.Fatalf("expected ECONNABORTED, got resp=%v err=nil", resp)
 				}
+				resp.Release()
 			}
 			// The connection must be torn down; a subsequent call fails fast.
 			zero2 := primitive.Uint32(0)

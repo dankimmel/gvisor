@@ -185,6 +185,11 @@ func TestHostConnectionCall(t *testing.T) {
 	if got != testObj {
 		t.Fatalf("payload: got %d, want %d", got, testObj)
 	}
+	resp.Release()
+
+	if !hc.pool.balanced() {
+		t.Errorf("buffer pool not balanced after Call+Release")
+	}
 }
 
 func TestHostConnectionInit(t *testing.T) {
@@ -312,6 +317,13 @@ func TestHostConnectionCallAsync(t *testing.T) {
 	if got != syncPayload {
 		t.Fatalf("payload after async: got %d, want %d", got, syncPayload)
 	}
+	resp.Release()
+
+	// The async reply is discarded (and its buffer released) by the reader; the
+	// sync reply was released above. The pool must balance.
+	if !hc.pool.balanced() {
+		t.Errorf("buffer pool not balanced after async+sync round-trips")
+	}
 }
 
 func TestHostConnectionConcurrent(t *testing.T) {
@@ -359,12 +371,17 @@ func TestHostConnectionConcurrent(t *testing.T) {
 				errs <- linuxerr.EINVAL
 				return
 			}
+			resp.Release()
 		}(uint32(i))
 	}
 
 	wg.Wait()
 	close(errs)
 	<-serverDone
+
+	if !hc.pool.balanced() {
+		t.Errorf("buffer pool not balanced after %d concurrent round-trips", numRequests)
+	}
 
 	for err := range errs {
 		t.Fatalf("concurrent call failed: %v", err)
