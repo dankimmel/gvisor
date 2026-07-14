@@ -28,6 +28,8 @@ func (i *inode) call(ctx context.Context, opcode linux.FUSEOpcode, in marshal.Ma
 	if err != nil {
 		return err
 	}
+	// The payload is fully consumed within this function, so release on return.
+	defer res.Release()
 	if err := res.Error(); err != nil {
 		return err
 	}

@@ -90,8 +90,10 @@ func (fd *fileDescription) Release(ctx context.Context) {
 	}
 	// Ignoring errors and FUSE server replies is analogous to Linux's behavior.
 	req := fs.conn.NewRequest(auth.CredentialsFromContext(ctx), pidFromContext(ctx), inode.nodeID, opcode, &in)
-	// The reply will be ignored since no callback is defined in asyncCallBack().
-	fs.conn.Call(ctx, req)
+	// The reply content is ignored, but its buffer must still be released.
+	if res, err := fs.conn.Call(ctx, req); err == nil {
+		res.Release()
+	}
 }
 
 // OnClose implements vfs.FileDescriptionImpl.OnClose.
@@ -117,6 +119,7 @@ func (fd *fileDescription) OnClose(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	defer res.Release()
 	return res.Error()
 }
 

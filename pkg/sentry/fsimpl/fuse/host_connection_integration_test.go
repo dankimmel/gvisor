@@ -363,6 +363,7 @@ func TestHostFUSEReadFile(t *testing.T) {
 	if entryOut.NodeID == 0 {
 		t.Fatal("LOOKUP returned nodeID 0")
 	}
+	lookupResp.Release()
 
 	// FUSE_OPEN
 	openIn := linux.FUSEOpenIn{Flags: uint32(linux.O_RDONLY)}
@@ -378,6 +379,7 @@ func TestHostFUSEReadFile(t *testing.T) {
 	if err := openResp.UnmarshalPayload(&openOut); err != nil {
 		t.Fatalf("OPEN unmarshal: %v", err)
 	}
+	openResp.Release()
 
 	// FUSE_READ
 	readIn := linux.FUSEReadIn{
@@ -397,6 +399,7 @@ func TestHostFUSEReadFile(t *testing.T) {
 	if string(readData) != testData {
 		t.Fatalf("READ data: got %q, want %q", string(readData), testData)
 	}
+	readResp.Release()
 
 	// FUSE_RELEASE
 	releaseIn := linux.FUSEReleaseIn{Fh: openOut.Fh}
@@ -407,6 +410,13 @@ func TestHostFUSEReadFile(t *testing.T) {
 	}
 	if releaseResp.Error() != nil {
 		t.Fatalf("RELEASE error: %v", releaseResp.Error())
+	}
+	releaseResp.Release()
+
+	// Every reply buffer acquired across LOOKUP/OPEN/READ/RELEASE must have been
+	// returned to the pool.
+	if !hc.pool.balanced() {
+		t.Errorf("buffer pool not balanced after full read round-trip")
 	}
 }
 
@@ -446,6 +456,7 @@ func TestHostFUSEWriteFile(t *testing.T) {
 	if err := lookupResp.UnmarshalPayload(&entryOut); err != nil {
 		t.Fatalf("LOOKUP unmarshal: %v", err)
 	}
+	lookupResp.Release()
 
 	// FUSE_OPEN for writing
 	openIn := linux.FUSEOpenIn{Flags: uint32(linux.O_WRONLY)}
@@ -461,6 +472,7 @@ func TestHostFUSEWriteFile(t *testing.T) {
 	if err := openResp.UnmarshalPayload(&openOut); err != nil {
 		t.Fatalf("OPEN unmarshal: %v", err)
 	}
+	openResp.Release()
 
 	// FUSE_WRITE
 	writeData := []byte("written via host FUSE passthrough\n")
@@ -487,11 +499,14 @@ func TestHostFUSEWriteFile(t *testing.T) {
 	if writeOut.Size != uint32(len(writeData)) {
 		t.Fatalf("WRITE size: got %d, want %d", writeOut.Size, len(writeData))
 	}
+	writeResp.Release()
 
 	// FUSE_RELEASE
 	releaseIn := linux.FUSEReleaseIn{Fh: openOut.Fh}
 	releaseReq := hc.conn.NewRequest(creds, 1, entryOut.NodeID, linux.FUSE_RELEASE, &releaseIn)
-	hc.Call(s.Ctx, releaseReq)
+	if releaseResp, err := hc.Call(s.Ctx, releaseReq); err == nil {
+		releaseResp.Release()
+	}
 
 	// Verify the data reached the host filesystem.
 	got, err := os.ReadFile(filepath.Join(backDir, "testfile"))

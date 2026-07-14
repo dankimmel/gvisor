@@ -623,6 +623,7 @@ func (i *inode) Valid(ctx context.Context, parent *kernfs.Dentry, name string) b
 	if err != nil {
 		return false
 	}
+	defer res.Release()
 	if res.Error() != nil {
 		return false
 	}
@@ -767,9 +768,11 @@ func (i *inode) Readlink(ctx context.Context, mnt *vfs.Mount) (string, error) {
 		if err != nil {
 			return "", err
 		}
+		defer res.Release()
 		if err := res.Error(); err != nil {
 			return "", err
 		}
+		// string() copies the payload, so the buffer can be released on return.
 		i.link = string(res.data[res.hdr.SizeBytes():])
 		if !mnt.Options().ReadOnly {
 			i.attrTime = ktime.ZeroTime
@@ -876,6 +879,8 @@ func (i *inode) GetXattr(ctx context.Context, opts vfs.GetXattrOptions) (string,
 	if err != nil {
 		return "", err
 	}
+	// All payloads are copied into strings before return, so release on return.
+	defer res.Release()
 	if err := res.Error(); err != nil {
 		return "", err
 	}
@@ -919,6 +924,8 @@ func (i *inode) ListXattr(ctx context.Context, size uint64) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
+	// All names are copied into strings before return, so release on return.
+	defer res.Release()
 	if err := res.Error(); err != nil {
 		return nil, err
 	}
