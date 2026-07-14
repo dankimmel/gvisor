@@ -61,6 +61,7 @@ func newTestHostConnectionType(t *testing.T, sockType int) (*hostConnection, int
 	conn.mu.Unlock()
 
 	hc := newHostConnection(conn, int32(fds[0]))
+	conn.fuseConn = hc
 	hc.startReader()
 
 	cleanup := func() {
@@ -518,6 +519,33 @@ func TestHostConnectionNoReplyInterleaved(t *testing.T) {
 	if nComp, nActive := activeRequestState(hc); nComp != 0 || nActive != 0 {
 		t.Errorf("interleaved no-reply leaked state: completions=%d, numActiveRequests=%d; want 0, 0", nComp, nActive)
 	}
+}
+
+// TestHostConnectionRejectsCheckpoint verifies that a host-FD connection rejects
+// checkpoint (beforeSave panics), while a device-FD connection does not.
+func TestHostConnectionRejectsCheckpoint(t *testing.T) {
+	hc, _, cleanup := newTestHostConnection(t)
+	defer cleanup()
+
+	func() {
+		defer func() {
+			if r := recover(); r == nil {
+				t.Error("expected beforeSave to panic for a host-FD connection")
+			}
+		}()
+		hc.conn.beforeSave()
+	}()
+
+	fsopts := filesystemOptions{
+		maxActiveRequests: maxActiveRequestsDefault,
+		maxRead:           4096,
+	}
+	dconn, err := newFUSEConnectionOpts(&fsopts)
+	if err != nil {
+		t.Fatalf("newFUSEConnectionOpts: %v", err)
+	}
+	// A device-FD connection must not panic.
+	dconn.beforeSave()
 }
 
 func TestHostConnectionNotConnected(t *testing.T) {

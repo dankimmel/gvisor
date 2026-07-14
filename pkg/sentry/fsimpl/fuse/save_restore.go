@@ -20,6 +20,18 @@ func (fRes *futureResponse) afterLoad(context.Context) {
 	fRes.ch = make(chan struct{})
 }
 
+// beforeSave is invoked by stateify. The host-FD transport cannot currently be
+// checkpointed: the host FD, the reader goroutine, its accumulation buffer, and
+// any in-flight requests are not part of the saved state, and afterLoad
+// unconditionally reconstructs a device-FD transport. Rather than silently
+// restoring a broken mount, reject the checkpoint loudly. Real support (via
+// Sentry-driven replay against a re-dialed backend) is implemented separately.
+func (conn *connection) beforeSave() {
+	if _, ok := conn.fuseConn.(*hostConnection); ok {
+		panic("fuse: host-FD FUSE connection does not support checkpoint/restore")
+	}
+}
+
 func (conn *connection) afterLoad(context.Context) {
 	conn.fuseConn = &deviceConn{conn: conn}
 }
