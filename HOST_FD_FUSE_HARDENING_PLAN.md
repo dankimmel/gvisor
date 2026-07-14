@@ -74,16 +74,22 @@ budgeted resource.**
 - **Backend provisioning = UDS.** runsc connects to a backend-owned Unix domain socket and
   donates the connected FD into the sandbox; runsc does NOT spawn backend processes.
   (A spawned-backend convenience mode could be layered on later; not in this plan.)
-- **Checkpoint/restore = Sentry-driven replay.** On restore, re-dial the UDS, re-INIT,
-  re-LOOKUP/re-OPEN from the Sentry's own saved state. **No backend state blob in the
-  checkpoint; backends need zero checkpoint code.** (Recommended and planned below;
-  final sign-off pending — see Stage 7.)
+- **Checkpoint/restore = Sentry-driven replay (gofer precedent; user-confirmed).** On
+  restore, re-dial the UDS, re-INIT, then re-LOOKUP/re-OPEN from the Sentry's own saved
+  state. **No backend state blob in the checkpoint; backends need zero checkpoint code.**
+  Accepted trade-offs, decided with eyes open: restore re-binds by *path* (a file replaced
+  at the same path between save and restore is silently re-bound to the new file;
+  unlinked-but-open files may fail restore), and restore cost scales with live
+  dentries/handles. A vhost-user `DEVICE_STATE`-style backend blob was considered in depth
+  and rejected — see Stage 7.
 
 ### Explicitly rejected — do not resurrect
 vhost-user-fs frontend; length-prefix framing; EAGAIN admission; reply buffers sized
 `max_read × depth`; epoll/shared-reader across mounts; SCM_RIGHTS / shared-memory data
-channel; implementing notification handling now; backend-serialized checkpoint blob;
-runsc-spawned FUSE backend processes.
+channel; implementing notification handling now; backend-serialized checkpoint blob (a
+vhost-user `DEVICE_STATE` analog — rejected in favor of the gofer replay precedent; if a
+future backend needs blob-level fidelity it can be added later as an optional negotiated
+extension, not in this plan); runsc-spawned FUSE backend processes.
 
 ---
 
@@ -473,11 +479,11 @@ Makes host-FUSE a declarable mount instead of an in-container privileged action,
 the rest of the plan an end-to-end harness. Precedence throughout: **Sentry hard clamp >
 per-container annotation > runsc flag > built-in default.**
 
-> **Design defaults adopted here (flag deviations to the user):** the backend endpoint is a
-> **Unix domain socket path in the mount's `source`** field; socket paths must fall under a
-> directory allowlisted by a new runsc flag (empty allowlist = feature disabled); backend
-> not listening at container start = **fail container creation** (single connect attempt
-> with a short timeout, no retry loop).
+> **Design decisions (user-confirmed; flag deviations to the user):** the backend endpoint
+> is a **Unix domain socket path in the mount's `source`** field; socket paths must fall
+> under a directory allowlisted by a new runsc flag (empty allowlist = feature disabled);
+> backend not listening at container start = **fail container creation** (single connect
+> attempt with a short timeout, no retry loop).
 
 **Commit 4.1 [GREEN] — runsc global flags**
 - `runsc/config/config.go`: `Config` fields with `flag:"fuse-max-inflight"`,
@@ -683,14 +689,17 @@ options landed in Stage 3); the small pool stays the global `respBufPool`.
 
 ### Stage 7 — Checkpoint/restore via Sentry-driven replay
 
-> **Model (recommended; get final user sign-off before starting this stage):** restore by
-> **replay from Sentry state**, mirroring gofer. The checkpoint contains ONLY Sentry-side
-> state; the backend contributes nothing and needs zero checkpoint-specific code. This is
-> what preserves the "any FUSE backend behind a UDS" ecosystem goal. The rejected
-> alternative — the backend serializing a state blob into gVisor's checkpoint — would
-> require a custom gVisor↔backend protocol beyond FUSE plus versioned serialization logic
-> in every backend. (If a future backend needs blob-style fidelity, it can be added as an
-> optional extension later; not here.)
+> **Model (user-confirmed):** restore by **replay from Sentry state**, mirroring gofer.
+> The checkpoint contains ONLY Sentry-side state; the backend contributes nothing and
+> needs zero checkpoint-specific code. This preserves the "any FUSE backend behind a UDS"
+> ecosystem goal. The rejected alternative — the backend serializing a state blob into
+> gVisor's checkpoint, analogous to vhost-user `VHOST_USER_PROTOCOL_F_DEVICE_STATE` — was
+> evaluated in depth and rejected: it requires a custom gVisor↔backend protocol beyond
+> FUSE plus versioned serialization logic in every backend. Its known advantages (binds by
+> inode identity rather than path, survives unlinked-open files and same-path replacement,
+> O(state-bytes) restore) are consciously traded away; if a future backend needs that
+> fidelity, a negotiated blob extension can be layered on later without disturbing this
+> design.
 
 How it works:
 - **Save:** quiesce the connection — stop admitting new requests (reuse the Stage 6
@@ -712,10 +721,15 @@ How it works:
 - **Backend contract (document in g3doc):** at restore the backend must be reachable at
   the socket path and serve the same underlying data; nodeids and file handles do NOT need
   to be stable across sessions (they are session-scoped and re-learned); a backend that
-  keeps per-handle state beyond what OPEN flags reconstruct will lose it. Files unlinked
-  while open cannot be re-looked-up by path — restore fails on them (same class of
-  limitation gofer handles via `restoreDeleted`; a fusefs analog can be scoped later if
-  needed).
+  keeps per-handle state beyond what OPEN flags reconstruct will lose it. Two accepted
+  limitations to state explicitly in the user-facing docs:
+  - **Path re-binding:** restore re-binds every dentry and handle *by path*. If the file
+    at a saved path was replaced between save and restore, the restored mount silently
+    binds to the new file. Snapshot users must treat the backend's data as
+    consistent/immutable across the save→restore gap.
+  - **Unlinked-but-open files** cannot be re-looked-up by path — restore fails on them
+    (same class of limitation gofer handles via `restoreDeleted`; a fusefs analog can be
+    scoped later if needed).
 
 Commit sketch (expand into proper [RED]/[GREEN] pairs — **present the expansion to the
 user for review before writing code for this stage**; it is the largest and subtlest):
