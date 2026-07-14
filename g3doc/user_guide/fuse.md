@@ -124,6 +124,12 @@ cmd.Run()
 *   **FUSE protocol only**: The host server must implement the raw FUSE kernel
     protocol. Higher-level FUSE libraries (e.g., libfuse) typically expect
     `/dev/fuse` and may not work directly over a socketpair without adaptation.
+*   **No server-initiated notifications**: The host-FD transport does not deliver
+    server-initiated notifications. A backend cannot push cache invalidation or
+    use STORE/RETRIEVE; cache coherence must come from the entry and attribute
+    validity timeouts returned on individual replies. Backends must not send
+    `FUSE_NOTIFY_RETRIEVE`, which expects a reply that is never sent and would
+    block the backend forever.
 
 ## In-Sandbox FUSE
 

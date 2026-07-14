@@ -191,8 +191,34 @@ func (hc *hostConnection) readLoop() {
 // dispatchReply routes a single framed reply to its waiting caller. Buffer
 // ownership transfers to the future; no payload is copied under conn.mu.
 func (hc *hostConnection) dispatchReply(hdr linux.FUSEHeaderOut, buf []byte) {
-	// Server-initiated notifications (header Unique == 0, notify code in Error)
-	// are not supported on this path: consume and discard.
+	// Server-initiated notifications are NOT supported on the host-FD path.
+	//
+	// A FUSE server may send unsolicited notifications, identified by a header
+	// Unique of 0 with the notification code in the header's Error field:
+	// FUSE_NOTIFY_POLL (1), _INVAL_INODE (2), _INVAL_ENTRY (3), _STORE (4),
+	// _RETRIEVE (5), and _DELETE (6). The reader consumes and discards them: it
+	// advances past Len bytes so the stream stays framed, logs the code, and takes
+	// no further action.
+	//
+	// Consequences for a backend served over this transport:
+	//
+	//  - Invalidation (_INVAL_INODE, _INVAL_ENTRY, _DELETE) does not reach the
+	//    Sentry. Client-side caches expire only via the per-reply validity
+	//    timeouts a backend sets on LOOKUP/GETATTR replies (entry and attribute
+	//    durations). A backend must drive coherence through those timeouts and
+	//    must not depend on pushed invalidation. The connection correspondingly
+	//    does not negotiate FUSE_WRITEBACK_CACHE or the auto-invalidation flags.
+	//
+	//  - Cache push/pull (_STORE, _RETRIEVE) is unsupported. _RETRIEVE is the one
+	//    notification that expects a FUSE_NOTIFY_REPLY from the client; because it
+	//    is discarded, a backend that sends _RETRIEVE and waits for the reply will
+	//    block forever. Backends on this transport must not send _RETRIEVE.
+	//
+	// Supporting notifications would mean handling these codes in the reader
+	// (routing _INVAL_* into VFS dentry and page-cache invalidation) and, for
+	// _RETRIEVE, adding a page-cache read plus a FUSE_NOTIFY_REPLY writer that
+	// carries the server's notify_unique and bypasses the completions map, since
+	// that reply is correlated by the server rather than the client.
 	if hdr.Unique == 0 {
 		log.Warningf("fuse host connection: discarding unsupported server notification (code %d)", hdr.Error)
 		return

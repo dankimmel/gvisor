@@ -42,6 +42,10 @@ const (
 
 	// The FUSE_INIT_IN flags sent to the daemon.
 	// TODO(gvisor.dev/issue/3199): complete the flags.
+	//
+	// fuseDefaultInitFlags intentionally omits FUSE_WRITEBACK_CACHE and the
+	// auto-invalidation flags: the host-FD path discards server notifications, so
+	// pushed cache invalidation is unavailable. See hostConnection's reader.
 	fuseDefaultInitFlags = linux.FUSE_MAX_PAGES
 
 	// An INIT response needs to be at least this long.
