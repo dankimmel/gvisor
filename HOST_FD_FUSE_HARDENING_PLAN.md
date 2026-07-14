@@ -15,11 +15,16 @@ talks to an in-sandbox `/dev/fuse` device (`deviceConn`). It *also* has a newer 
 FD**, letting a FUSE server *outside* the sandbox serve the filesystem. Data crosses the FD
 by plain `read`/`write` copies ("copy-through-FD").
 
-The host transport works but is minimal. This project hardens it for a high-throughput
-external backend. Target shape: **one FD per mount, few mounts per sandbox, high I/O
-parallelism within a mount. RAM is the budgeted resource.**
+Today that host FD is only reachable if something *inside* the container calls
+`mount -t fuse -o fd=N` itself (see `test/fuse_host/workload/workload.go`). There is no
+runsc-side provisioning.
 
-### The six problems we fix
+The host transport works but is minimal. This project hardens it for a high-throughput
+external backend and makes it a first-class runsc storage option. Target shape: **one FD
+per mount, few mounts per sandbox, high I/O parallelism within a mount. RAM is the
+budgeted resource.**
+
+### The problems we fix
 1. **Request leak on no-reply requests.** `FUSE_FORGET` gets no reply; the host path still
    registers a completion + active-request slot that nothing ever clears. Permanent leak.
 2. **One-read-one-message reader with a hard 8 KB cap.** The reader does one `unix.Read`
@@ -32,6 +37,11 @@ parallelism within a mount. RAM is the budgeted resource.**
    count unconditionally. The device path blocks when full; the host path does not.
 5. **Memory limits are hardcoded constants**, not tunable per mount.
 6. **Server-initiated notifications are undefined behavior** on this path.
+7. **No runsc provisioning.** The mount can't be declared in the OCI spec / pod
+   annotations; a privileged in-container agent has to issue it.
+8. **Checkpoint/restore silently corrupts.** `save_restore.go`'s `afterLoad`
+   unconditionally resets `conn.fuseConn = &deviceConn{...}`; the host FD and reader
+   goroutine are never restored. A checkpoint of a host-FUSE sandbox restores broken.
 
 ### Locked design decisions — DO NOT REVISIT (deviation needs explicit sign-off)
 - **Framing:** stream-frame on the FUSE header's self-describing `Len` field. No added
@@ -61,11 +71,19 @@ parallelism within a mount. RAM is the budgeted resource.**
 - **Config precedence:** Sentry hard clamp > per-container annotation > runsc flag >
   built-in default. The Sentry clamps are the security boundary; everything from runsc /
   annotations is *untrusted input* to the Sentry.
+- **Backend provisioning = UDS.** runsc connects to a backend-owned Unix domain socket and
+  donates the connected FD into the sandbox; runsc does NOT spawn backend processes.
+  (A spawned-backend convenience mode could be layered on later; not in this plan.)
+- **Checkpoint/restore = Sentry-driven replay.** On restore, re-dial the UDS, re-INIT,
+  re-LOOKUP/re-OPEN from the Sentry's own saved state. **No backend state blob in the
+  checkpoint; backends need zero checkpoint code.** (Recommended and planned below;
+  final sign-off pending — see Stage 7.)
 
 ### Explicitly rejected — do not resurrect
 vhost-user-fs frontend; length-prefix framing; EAGAIN admission; reply buffers sized
 `max_read × depth`; epoll/shared-reader across mounts; SCM_RIGHTS / shared-memory data
-channel; implementing notification handling now.
+channel; implementing notification handling now; backend-serialized checkpoint blob;
+runsc-spawned FUSE backend processes.
 
 ---
 
@@ -76,7 +94,9 @@ channel; implementing notification handling now.
   existing FD (the seccomp filters in `runsc/boot/filter/` allow those; `readv`/`writev`
   are NOT to be added). `UnmarshalUnsafe`/`MarshalUnsafe` on ABI structs are the codebase's
   established pattern and are fine — they are not new `unsafe`. **If you think you need
-  anything cgo/unsafe/new-syscall-shaped, STOP and ask the user first.**
+  anything cgo/unsafe/new-syscall-shaped, STOP and ask the user first.** (Note: the runsc
+  CLI process connecting to a UDS in Stage 4 is *not* a Sentry syscall — runsc-side code
+  runs unsandboxed before boot and may use ordinary net/unix dials.)
 - **Stick to this plan.** Do not reimplement standard-library primitives, do not add new
   third-party dependencies, do not pull in a new test framework or mocking library. The
   existing test scaffolding (`host_connection_test.go`, socketpair + fake server) is what
@@ -88,11 +108,22 @@ channel; implementing notification handling now.
 - **TDD religiously.** Wherever practical, split each feature into two commits:
   (a) interface/signature changes + tests that are all initially **failing (red)**, then
   (b) the implementation that makes them pass **(green)**. Commit messages should say which.
+- **Before EVERY commit: auto-format and run the tests.**
+  - Format every touched Go file with `gofmt` (and keep imports goimports-clean, matching
+    the file's existing grouping style). If you touched BUILD files, format them with
+    buildifier conventions (match surrounding style if the tool isn't available). Never
+    commit unformatted code.
+  - Run the affected package tests. **All tests must be green**, with exactly one
+    exception: a **[RED]** commit may be committed with its *newly added* tests failing —
+    that's the point of a RED commit. Even then, every *pre-existing* test must still pass
+    and the tree must compile. The immediately following **[GREEN]** commit must turn those
+    new tests green; never leave red tests dangling across more than that one commit
+    boundary.
 - **Cleanup commits are allowed.** If you discover you need a small refactor / bug fix /
   rename that wasn't in this plan, it's fine to insert a focused commit for it. Keep it
   focused and say so in the message.
-- **Every stage compiles and passes tests on its own** and is independently revertable. Do
-  NOT reorder stages; later stages depend on earlier ones.
+- **Every stage ends green and is independently revertable.** Do NOT reorder stages; later
+  stages depend on earlier ones.
 - **Verify before every commit** (see "Invariants" at the end). Run the fuse package tests
   and, when the toolchain allows, `-race` and the nogo/checklocks static checks.
 
@@ -119,7 +150,7 @@ style exactly.
 
 ## 2. Key facts about the current code (so you don't have to rediscover them)
 
-Files you will touch live in `pkg/sentry/fsimpl/fuse/`:
+Files you will touch live in `pkg/sentry/fsimpl/fuse/` (Sentry) and `runsc/` (provisioning):
 
 - **`connection.go`** — the shared `connection` struct and the `fuseConn` interface
   (`call`, `release`). Two implementations: `deviceConn` (in-file) and `hostConnection`
@@ -159,7 +190,7 @@ Files you will touch live in `pkg/sentry/fsimpl/fuse/`:
   - `resolve(b)` — for async returns `(nil,nil)` immediately; otherwise `b.Block(f.ch)`
     then `getResponse()`. **On `b.Block` error (interruption) it returns `(nil, err)` and
     does NOT touch `completions` or `numActiveRequests`** — the caller's error path must do
-    that. (This matters for the interruption-ownership rule in Stage 4.)
+    that. (This matters for the interruption-ownership rule in Stage 6.)
   - `Response` = `{opcode, hdr linux.FUSEHeaderOut, data []byte}`. `Error()`, `DataLen()`,
     `UnmarshalPayload()`.
   - `NewRequest` steps `nextOpID` by `reqIDStep = 2` under `conn.mu`. Keep global.
@@ -180,9 +211,8 @@ Files you will touch live in `pkg/sentry/fsimpl/fuse/`:
   `InitRecv` negotiates limits. **Do not change the negotiated-flags set** (WRITEBACK_CACHE,
   READDIRPLUS, locks, ASYNC_DIO, PARALLEL_DIROPS, auto-inval all stay unsupported).
 - **`save_restore.go`**: `connection.afterLoad` sets `conn.fuseConn = &deviceConn{conn:
-  conn}` unconditionally, and there is no host-FD restore of the FD or reader goroutine.
-  **So host-FD save/restore is already effectively unsupported.** We preserve that
-  explicitly (see Stage 2 note) rather than fixing it — S/R support is out of scope.
+  conn}` unconditionally; no host-FD restore of the FD or reader goroutine. Stage 2 makes
+  checkpoint of host-FUSE mounts fail loudly; Stage 7 implements real support.
 - **ABI** (`pkg/abi/linux/fuse.go`): defines `FUSE_NOTIFY_REPLY = 41` and
   `FUSE_MIN_READ_BUFFER = 8192`. The individual notify codes (POLL=1, INVAL_INODE=2,
   INVAL_ENTRY=3, STORE=4, RETRIEVE=5, DELETE=6) are **not** defined and we do **not** need
@@ -192,8 +222,30 @@ Files you will touch live in `pkg/sentry/fsimpl/fuse/`:
   uses `SOCK_SEQPACKET`. Helpers: `newTestHostConnection`, `echoServer`, `echoServerN`,
   `setup(t)` (from `utils_test.go`), `echoTestOpcode`. **New framing tests must use
   `SOCK_STREAM`** to actually exercise the framer.
+- **runsc mount machinery** (for Stage 4):
+  - `runsc/boot/vfs.go:getMountNameAndOptions` (~line 987) dispatches spec mounts by type:
+    gofer/Bind mounts get `goferMountData(fd, ...)`; EROFS gets
+    `data = []string{fmt.Sprintf("ifd=%d", m.goferFD.Release())}` (line ~1073). FDs arrive
+    via the `fdDispenser` (`goferFDs`) — FDs donated to the sandbox process across exec.
+    A `case fuse.Name:` here is the natural insertion point.
+  - **Per-mount annotation overrides already exist**: `dev.gvisor.spec.mount.<name>.
+    {type,source,share,options}` (`runsc/boot/mount_hints.go:32`, `MountPrefix`). This is
+    the k8s-friendly way a pod volume becomes a fuse mount without touching the OCI spec.
+  - Per-container annotation precedent: `specutils.AnnotationCPUFeatures` read in
+    `runsc/boot/loader.go` (~line 692).
+  - runsc flags: `runsc/config/config.go` (`flag:"name"` tags) + `runsc/config/flags.go`
+    registration; flags must be accepted identically by `create` and `boot`.
+  - **Restore FD donation precedent**: `runsc/boot/vfs.go:configureRestore` (~line 1510)
+    builds an fdmap keyed by `checkpoint.ResourceID`; gofer mounts consume fresh FDs from
+    it on restore.
+- **gofer save/restore precedent** (for Stage 7): `pkg/sentry/fsimpl/gofer/save_restore.go`
+  implements `vfs.FilesystemImplSaveRestoreExtension`: `PrepareSave` purges cached dentries
+  that can't be reopened after restore; `CompleteRestore` pulls a fresh connection FD from
+  `vfs.RestoreFilesystemFDMapFromContext(ctx)`, re-walks live dentries recursively
+  (`restoreDescendantsRecursive`), and even recovers deleted-but-open files
+  (`restoreDeleted`). Stage 7 mirrors this shape for fusefs.
 
-### The Release call sites you must audit (Stage 3)
+### The Release call sites you must audit (Stage 5)
 Every code path that gets a `*Response` from a `Call`/`callRaw` must end by calling
 `res.Release()` on **every** exit including error-only replies. Known sites (grep
 `\.Call(`, `callRaw(`, `UnmarshalPayload(` under the package to confirm none were added):
@@ -216,7 +268,16 @@ Every code path that gets a `*Response` from a `Call`/`callRaw` must end by call
 ## 3. Commit-by-commit plan
 
 Legend: **[RED]** = adds only tests/signatures, expected to fail. **[GREEN]** = makes them
-pass. **[REFactor/DOC]** = no behavior change. Aim <200 production LOC/commit.
+pass. **[REFACTOR/DOC]** = no behavior change. Aim <200 production LOC/commit.
+
+Stage order and why: the framer (Stage 2) is the prerequisite for SOCK_STREAM transport,
+which the UDS provisioning needs. Configuration (Stage 3) and the runsc surface (Stage 4)
+come next so that (a) later stages consume real, clamped option values instead of test
+defaults, and (b) an end-to-end runsc→UDS→backend harness exists *before* the two riskiest
+stages (buffer ownership, admission control) so they get integration coverage. Buffer pools
+(Stage 5) precede admission (Stage 6) because the admission tests assert buffer/permit
+reclamation. Checkpoint/restore (Stage 7) is last: it depends on the quiesce machinery from
+admission, the restore-time re-dial from Stage 4, and stable buffer ownership from Stage 5.
 
 ### Stage 1 — D1: no-reply request leak (fix first, self-contained)
 
@@ -248,12 +309,12 @@ pass. **[REFactor/DOC]** = no behavior change. Aim <200 production LOC/commit.
 
 ---
 
-### Stage 2 — F1: stream framer + notification discard + docs
+### Stage 2 — F1: stream framer + notification discard + docs + explicit S/R rejection
 
 Goal: remove the 8 KB reply cap and the message-preserving-FD requirement. A single
 `readFrame()` owns wire parsing for both the reader goroutine and the synchronous INIT
 path. **In this stage buffers are still plain `make([]byte, Len)` allocations** (pooling is
-Stage 3) — just size them to `Len` instead of a fixed 8 KB, and transfer the slice to the
+Stage 5) — just size them to `Len` instead of a fixed 8 KB, and transfer the slice to the
 future. Stop copying under `conn.mu`.
 
 **Commit 2.1 [RED] — framing test matrix + `readFrame` signature**
@@ -290,19 +351,19 @@ future. Stop copying under `conn.mu`.
   3. Validate `Len`: `>= SizeOfFUSEHeaderOut` and `<= maxFrame`. Invalid ⇒ return a
      sentinel error; the caller tears the connection down. **Never skip-and-continue** —
      FUSE stream framing has no resync point.
-  4. Allocate `buf := make([]byte, Len)` (Stage 3 replaces this with a pooled buffer). Copy
+  4. Allocate `buf := make([]byte, Len)` (Stage 5 replaces this with a pooled buffer). Copy
      the already-buffered bytes in, then loop reading directly into `buf[filled:]` until
      `Len` bytes are present. Any bytes past `Len` already in the accumulation buffer are
      the start of the next frame — retain them.
   5. Return `(hdr, buf, nil)`.
-- `maxFrame`: for this stage define it as `conn.maxRead + SizeOfFUSEHeaderOut` (Stage 5 ties
+- `maxFrame`: for this stage define it as `conn.maxRead + SizeOfFUSEHeaderOut` (Stage 3 ties
   it to `reply_buf_max` and enforces the coupling rule so a well-behaved backend can never
-  trip teardown). Keep it a single clearly-named local/const so Stage 5 can redefine it.
+  trip teardown). Keep it a single clearly-named local/const so Stage 3 can redefine it.
 - Rewrite `readLoop()` to loop on `readFrame()` and dispatch each frame:
   - `err != nil` (EOF, read error, or invalid `Len`): `abortPending()`, mark disconnected
     (`connected = false` under `conn.mu`), close the FD if appropriate, return.
   - `hdr.Unique == 0`: **notification.** Log the code (`hdr.Error`) at Warning, drop the
-    buffer, continue. Put the required documentation comment block here (see Docs below).
+    buffer, continue. Put the required documentation comment block here (see 2.3).
   - `hdr.Unique` in `completions`: delete entry, `fut.hdr = &hdr`, `fut.data = buf`
     (transfer ownership; **no copy under `conn.mu`**), decrement `numActiveRequests`,
     non-blocking signal `fullQueueCh`, close `fut.ch`.
@@ -311,9 +372,7 @@ future. Stop copying under `conn.mu`.
   INIT reply (INIT fits the small class), build the `Response`, then `startReader()`. One
   parser, no duplicated header logic.
 - Because `fut.data` now carries a right-sized slice, the host path no longer uses
-  `futureResponse.buf`. You may leave the field unused until Stage 3 deletes it, or delete
-  it now if nothing references it (device path never used it). Prefer deleting in Stage 3 to
-  keep this commit small.
+  `futureResponse.buf`. Prefer deleting the field in Stage 5 to keep this commit small.
 
 **Commit 2.3 [DOC] — documentation deliverables**
 - File: `host_connection.go` (at the notification-discard path) — insert verbatim (adjust
@@ -354,23 +413,144 @@ future. Stop copying under `conn.mu`.
   // auto-invalidation flags: the host-FD path discards server notifications, so
   // pushed cache invalidation is unavailable. See hostConnection's reader.
   ```
-- If a g3doc page exists (`g3doc/user_guide/fuse.md` — it does), add a limitations
-  paragraph: the host-FD transport does not deliver server-initiated notifications; cache
-  coherence must come from entry/attribute validity timeouts; backends must not send
-  `FUSE_NOTIFY_RETRIEVE`.
-- Add a one-line comment near `save_restore.go`'s `afterLoad` (or the host connection type)
-  noting host-FD mounts do not support checkpoint/restore (the reader goroutine and host FD
-  are not restored; `afterLoad` reverts to a device conn). This makes the existing
-  limitation explicit; do not attempt to fix S/R here.
+- `g3doc/user_guide/fuse.md`: add a limitations paragraph: the host-FD transport does not
+  deliver server-initiated notifications; cache coherence must come from entry/attribute
+  validity timeouts; backends must not send `FUSE_NOTIFY_RETRIEVE`.
+
+**Commit 2.4 [GREEN, small] — reject checkpoint of host-FUSE mounts loudly**
+- Today a checkpoint of a sandbox with a host-FUSE mount *silently corrupts*: `afterLoad`
+  reverts the transport to a `deviceConn` and the host FD/reader are gone. Until Stage 7
+  lands real support, make save **fail with a clear error** for filesystems whose
+  connection uses a `hostConnection` (follow the codebase's existing pattern for
+  save-rejection — e.g. a `beforeSave` hook or the `PrepareSave` extension returning an
+  error; find the idiomatic mechanism in-tree and use it).
+- Test: attempt a save of a host-connection fusefs in the unit harness (or at minimum a
+  direct `beforeSave` invocation) and assert the error.
+- Stage 7 deletes this rejection and replaces it with real support.
 
 ---
 
-### Stage 3 — F2: buffer pools, `Response.Release()`, enforcement
+### Stage 3 — Sentry configuration: options, clamps, coupling rule
+
+Land the per-mount options and hard clamps now so every later stage consumes real,
+clamped values. Two of the three options wire into behavior immediately (`max_inflight` →
+`maxActiveRequests`/`fullQueueCh`; `reply_buf_max` → `maxFrame`); `reply_buf_concurrency`
+is parsed, clamped, and stored now, and consumed by the pools in Stage 5.
+
+**Commit 3.1 [RED] — option parsing, clamps, coupling tests**
+- `fusefs_test.go` (create if absent, or extend the existing package tests): test
+  `parseOptions` for `max_inflight`, `reply_buf_max`, `reply_buf_concurrency`:
+  - Defaults applied when absent.
+  - Values above ceilings **clamp, not error**; values below floors clamp up.
+  - Invalid (non-numeric) values → error, matching existing `max_read` behavior.
+  - New **upper** clamp on `max_read`.
+  - Coupling rule: effective `max_read ≤ reply_buf_max − SizeOfFUSEHeaderOut`; conflicting
+    values clamp `max_read` down (and log), never error.
+- Framer test: `maxFrame` now equals the parsed/clamped `reply_buf_max`; a frame larger
+  than it tears down the connection (adjust the Stage 2 matrix test if it hardcoded the
+  old formula).
+
+**Commit 3.2 [GREEN] — implement options + clamps + wiring**
+- `fusefs.go` `filesystemOptions`: add `maxInflight uint64` (mount opt `max_inflight`;
+  for host-FD mounts this replaces the hardcoded `maxActiveRequestsDefault`; device path
+  keeps its default), `replyBufMax uint32` (mount opt `reply_buf_max`, bytes — the
+  large-class ceiling), `replyBufConcurrency uint32` (mount opt `reply_buf_concurrency`).
+- Hard clamp constants near `fuseMinMaxRead`: `fuseMaxMaxInflight`, `fuseMaxReplyBuf`
+  (suggest 4 MiB), `fuseMaxReplyBufConcurrency`, plus the `max_read` upper clamp. Parse →
+  clamp → store for each. Sane built-in defaults. Values are untrusted (they may originate
+  from container annotations).
+- Thread `maxInflight` into `newFUSEConnectionOpts` (it sizes `maxActiveRequests` and
+  `fullQueueCh` — the option value is available there via `opts`). Redefine the framer's
+  `maxFrame` as the connection's `replyBufMax`.
+- Store `replyBufMax`/`replyBufConcurrency` on the connection for Stage 5. Add
+  `+checklocks` annotations for any new mutable connection fields, matching existing style.
+
+---
+
+### Stage 4 — runsc surface: flags, annotations, UDS mount provisioning
+
+Makes host-FUSE a declarable mount instead of an in-container privileged action, and gives
+the rest of the plan an end-to-end harness. Precedence throughout: **Sentry hard clamp >
+per-container annotation > runsc flag > built-in default.**
+
+> **Design defaults adopted here (flag deviations to the user):** the backend endpoint is a
+> **Unix domain socket path in the mount's `source`** field; socket paths must fall under a
+> directory allowlisted by a new runsc flag (empty allowlist = feature disabled); backend
+> not listening at container start = **fail container creation** (single connect attempt
+> with a short timeout, no retry loop).
+
+**Commit 4.1 [GREEN] — runsc global flags**
+- `runsc/config/config.go`: `Config` fields with `flag:"fuse-max-inflight"`,
+  `flag:"fuse-reply-buf-max"`, `flag:"fuse-reply-buf-concurrency"`, and
+  `flag:"fuse-allowed-socket-dirs"` (comma-separated list; empty disables UDS fuse
+  provisioning). Host-wide defaults for the first three.
+- `runsc/config/flags.go`: register them. Accepted identically by `create` and `boot`.
+- Tests: extend the existing config round-trip/flag tests.
+
+**Commit 4.2 [GREEN] — per-container annotations**
+- `runsc/specutils`: constants `dev.gvisor.fuse.max-inflight`,
+  `dev.gvisor.fuse.reply-buf-max`, `dev.gvisor.fuse.reply-buf-concurrency`.
+- `runsc/boot/loader.go`: read them following the `specutils.AnnotationCPUFeatures`
+  pattern (~line 692), overriding the flag defaults for that container. Do NOT use the
+  debug-only `dev.gvisor.flag.<name>` override.
+- Note: *per-mount* values need no new annotation surface — the existing
+  `dev.gvisor.spec.mount.<name>.options` mount-hint annotations can carry
+  `max_inflight=`/`reply_buf_max=`/`reply_buf_concurrency=` once 4.3 lands.
+- Tests: annotation parsing + precedence (annotation beats flag; garbage values rejected
+  or clamped — decide to match `AnnotationCPUFeatures` error behavior; Sentry clamps
+  still bound everything downstream).
+
+**Commit 4.3 [RED] — provisioning tests (mount assembly)**
+- Tests for a new `case fuse.Name:` in `runsc/boot/vfs.go:getMountNameAndOptions` (unit
+  level, mirroring how gofer/erofs mount assembly is tested in `runsc/boot/` tests if such
+  tests exist — check first; otherwise test the option-string builder as a pure function):
+  - A spec mount `type=fuse, source=/allowed/dir/backend.sock` produces mount data
+    containing `fd=N` (a dispensed FD), synthesized `user_id`/`group_id` (container root
+    uid/gid), `rootmode=40000`, and the three tuning options resolved per precedence.
+  - Source outside the allowlist → error at create time.
+  - Empty allowlist → fuse spec mounts rejected with a clear error.
+- Tests for the connect step (pure runsc-side, can use a real listening UDS in a temp
+  dir): success path donates a SOCK_STREAM FD; no listener → error containing the socket
+  path; connect timeout honored.
+
+**Commit 4.4 [GREEN] — implement UDS connect + FD donation + mount emission**
+- runsc CLI side (create/boot, pre-sandbox): for each spec mount of type `fuse`, validate
+  the source against `--fuse-allowed-socket-dirs`, `net.Dial("unix", ...)` with a short
+  timeout, and donate the connected FD to the sandbox process via the existing FD-passing
+  channel the gofer FDs use (find the exact plumbing — `donations`/`fdDispenser` — and
+  ride it; do not invent a parallel mechanism).
+- `runsc/boot/vfs.go`: `case fuse.Name:` in `getMountNameAndOptions` consuming the
+  dispensed FD and emitting the option string from 4.3. The Sentry's existing
+  `parseOptions`/`getFilesystemHostFD` path takes it from there unchanged.
+- Fail-fast: any error here fails container creation with a message naming the mount and
+  socket path.
+- Keep the existing in-container `mount -t fuse -o fd=N` path working unchanged (it's
+  covered by `test/fuse_host/`); the new path is additive.
+- This commit may run over 200 production lines with the dial + donation + emission
+  pieces; if so split CLI-side (dial+donate) and boot-side (emission) into two commits.
+
+**Commit 4.5 [GREEN] — e2e integration test**
+- Extend `test/fuse_host/` (check what exists and extend rather than invent): a test where
+  runsc provisions the mount from a spec/annotation against a test FUSE backend listening
+  on a UDS, exercising mount + I/O + unmount, and one failure case (no listener → create
+  fails). This harness is then reused by Stages 5–6 for integration coverage.
+
+**Commit 4.6 [DOC] — document options, flags, annotations**
+- `g3doc/user_guide/fuse.md`: the new mount options (`max_inflight`, `reply_buf_max`,
+  `reply_buf_concurrency`), the runsc flags, the annotations, the UDS provisioning flow
+  (allowlist, fail-fast), the `max_read`/`reply_buf_max` coupling rule, and the RAM formula
+  `8KB × max_inflight + reply_buf_max × reply_buf_concurrency`.
+
+---
+
+### Stage 5 — F2: buffer pools, `Response.Release()`, enforcement
 
 The wide-blast-radius stage. Land the pool + Release + counters + finalizer with handlers
-converted mechanically first, then the READ-path aliasing audit as its own commit.
+converted mechanically first, then the READ-path aliasing audit as its own commit. The
+gate and large pool are **connection-scoped** (their ceiling/size come from the per-mount
+options landed in Stage 3); the small pool stays the global `respBufPool`.
 
-**Commit 3.1 [RED] — pool/Release/gate/counter API + tests**
+**Commit 5.1 [RED] — pool/Release/gate/counter API + tests**
 - New file `pool.go` (or add to `request_response.go`) with the *types and signatures*, plus
   tests, no wiring yet:
   - `pooledBuf struct { bytes []byte; class uint8; released bool }` (+ under the debug const,
@@ -379,9 +559,9 @@ converted mechanically first, then the READ-path aliasing audit as its own commi
   - Small pool: repurpose `respBufPool` (8 KB slices).
   - Large pool: `sync.Pool` of variable-capacity slices. `Get(need int)` returns a buffer
     with `cap >= need`; if the pooled slice is too small, allocate rounded up to a 64 KB
-    multiple, capped at the configured ceiling.
+    multiple, capped at the connection's `replyBufMax`.
   - Large-class **gate**: a counting semaphore = buffered `chan struct{}` of size
-    `reply_buf_concurrency`, acquired before taking a large buffer, released when the buffer
+    `replyBufConcurrency`, acquired before taking a large buffer, released when the buffer
     is released.
   - Per-class atomic acquire/release counters, exported for tests
     (e.g. `bufPoolStats()` returning acquired/released per class).
@@ -393,7 +573,7 @@ converted mechanically first, then the READ-path aliasing audit as its own commi
 - Tests (`pool_test.go`):
   - Acquire/release balance per class after quiescence.
   - Large `Get(need)` returns cap ≥ need, rounds to 64 KB multiple, respects the ceiling.
-  - Gate blocks when `reply_buf_concurrency` large buffers are live and unblocks on release
+  - Gate blocks when `replyBufConcurrency` large buffers are live and unblocks on release
     (use a goroutine + timeout).
   - `Release()` is idempotent (double Release does not double-count, does not double-release
     the permit).
@@ -404,25 +584,27 @@ converted mechanically first, then the READ-path aliasing audit as its own commi
     `*_debug_test.go` with a build tag and document how to run it.)
 - These fail: no implementation yet.
 
-**Commit 3.2 [GREEN] — implement pools/gate/counters/finalizer + Response carries pbuf**
-- Implement everything from 3.1.
+**Commit 5.2 [GREEN] — implement pools/gate/counters/finalizer + Response carries pbuf**
+- Implement everything from 5.1, sizing the gate and ceiling from the Stage 3 options.
 - Add `pbuf *pooledBuf` to `Response` (and thread it through `futureResponse` →
   `getResponse`). Host path: framer attaches the pooled buffer; `getResponse` copies the
   pointer into the `Response`. Device path: constructs `Response` with `pbuf == nil` as
   today.
-- **Delete `futureResponse.buf [FUSE_MIN_READ_BUFFER]byte`** now (host path no longer uses
-  it after Stage 2).
-- Wire `readFrame` (Stage 2) to take buffers from the pools: small if `Len <= 8192`, else
-  acquire the gate then a large buffer. Wire every reader dispatch path to release when it
-  does not transfer ownership: **notification discard, unknown-Unique drop, and teardown**
-  all `Release`/return the buffer + permit. The only path that does NOT release in the
-  reader is the successful transfer to a live future (the handler releases later).
+- **Delete `futureResponse.buf [FUSE_MIN_READ_BUFFER]byte`** (host path no longer uses it
+  after Stage 2).
+- Wire `readFrame` to take buffers from the pools: small if `Len <= 8192`, else acquire the
+  gate then a large buffer. Wire every reader dispatch path to release when it does not
+  transfer ownership: **notification discard, unknown-Unique drop, and teardown** all
+  `Release`/return the buffer + permit. The only path that does NOT release in the reader
+  is the successful transfer to a live future (the handler releases later).
 - `abortPending`: any pending future that already owns a buffer isn't the reader's to
   release; but buffers held by the reader mid-frame on teardown must be released. Ensure no
   large permit is stranded on any exit.
 - Verify counters balance in existing round-trip tests.
+- If this commit exceeds ~200 LOC (likely), split it: pool + counters + Release in one
+  commit, framer/reader wiring in the next.
 
-**Commit 3.3 [GREEN] — thread `Release()` through opcode handlers (mechanical)**
+**Commit 5.3 [GREEN] — thread `Release()` through opcode handlers (mechanical)**
 - Convert the ~dozen handlers to call `res.Release()` on every exit path, including
   error-only replies (`Len == header size` still holds a small buffer) and early error
   returns. Prefer `defer res.Release()` immediately after a successful `Call` wherever the
@@ -433,29 +615,31 @@ converted mechanically first, then the READ-path aliasing audit as its own commi
 - Tests: per-opcode round-trip tests (extend existing device + host tests) asserting
   acquire == release at quiescence for LOOKUP, GETATTR, SETATTR, OPEN/CREATE, READLINK,
   READDIR, xattr ops, STATFS, and the `CallAsync` discard path, and the error-reply path.
+- Handlers must stay transport-agnostic: they call `Release()` unconditionally and never
+  know which transport served them (device path Release is a no-op).
 
-**Commit 3.4 [GREEN] — READ-path aliasing audit + release-at-copy-out**
+**Commit 5.4 [GREEN] — READ-path aliasing audit + release-at-copy-out**
 - `read_write.go` `ReadInPages` returns slices aliasing `res.data`. Move the `Release()` to
   the **copy-out point in the caller** (where the read bytes are copied toward the
   application), after the last read of the aliased slice. Ensure every early return in the
   READ path also releases.
+- Audit package-wide whether `Response`/`res.data` escapes anywhere else beyond
+  `ReadInPages` (grep for `res.data` and `Response` retention); document findings in the
+  commit message.
 - Test: a READ round-trip with a payload larger than 8 KB (exercising the large class),
   verifying data integrity end-to-end. Add an aliasing-after-release regression test: under
   `debugFUSEBuffers`, have the pool **poison** returned buffers (overwrite with a sentinel
   on Release); assert the copied-out application data is intact, proving Release does not
   precede copy-out.
 - Stress test: sustained mixed load (many concurrent LOOKUP/GETATTR/READ), assert counters
-  stay balanced and bounded with no monotonic growth.
-
-> If 3.2 exceeds ~200 LOC (likely, given pool + gate + finalizer + wiring), split it: pool +
-> counters + Release in one commit, framer/reader wiring in the next. That's an expected,
-> allowed split — keep each focused.
+  stay balanced and bounded with no monotonic growth. Run the Stage 4 e2e harness against
+  this stage as an integration check.
 
 ---
 
-### Stage 4 — F3: admission control (blocking-guest) + interruption ownership
+### Stage 6 — F3: admission control (blocking-guest) + interruption ownership
 
-**Commit 4.1 [RED] — admission + abort + interruption tests**
+**Commit 6.1 [RED] — admission + abort + interruption tests**
 - `host_connection_test.go`: a fake server that **withholds replies** on demand.
   - Issue `max_inflight` (`maxActiveRequests`) requests that never get replies; assert the
     next `Call` **blocks** (goroutine + timeout).
@@ -471,7 +655,7 @@ converted mechanically first, then the READ-path aliasing audit as its own commi
   - `noReply` requests proceed even while the gate is full (they consume no slot).
 - These fail: no host-path admission wait yet.
 
-**Commit 4.2 [GREEN] — shared `waitForSlot` + host gate + abort drain + ownership rule**
+**Commit 6.2 [GREEN] — shared `waitForSlot` + host gate + abort drain + ownership rule**
 - `connection.go`: extract the device path's wait loop into a shared helper, e.g.
   `func (conn *connection) waitForSlot(b context.Blocker) error` that, under `conn.mu`,
   loops while `numActiveRequests == maxActiveRequests`, unlocking around
@@ -494,86 +678,62 @@ converted mechanically first, then the READ-path aliasing audit as its own commi
   a buffer.** No path may have both resolver and reader believing they own the buffer.
   Verify `futureResponse.resolve`'s current behavior (it returns `(nil, err)` and touches
   nothing) matches this and align the caller.
-- `fullQueueCh` capacity: it is sized from `maxActiveRequests` at connection creation in
-  `newFUSEConnectionOpts`; when `maxActiveRequests` becomes per-mount configurable
-  (Stage 5), confirm the option value is available there (it is — `opts.maxActiveRequests`).
 
 ---
 
-### Stage 5 — F4: configuration plumbing
+### Stage 7 — Checkpoint/restore via Sentry-driven replay
 
-Precedence: **Sentry hard clamp > per-container annotation > runsc flag > built-in
-default.** Sentry clamps are the security boundary; runsc/annotation values are untrusted.
+> **Model (recommended; get final user sign-off before starting this stage):** restore by
+> **replay from Sentry state**, mirroring gofer. The checkpoint contains ONLY Sentry-side
+> state; the backend contributes nothing and needs zero checkpoint-specific code. This is
+> what preserves the "any FUSE backend behind a UDS" ecosystem goal. The rejected
+> alternative — the backend serializing a state blob into gVisor's checkpoint — would
+> require a custom gVisor↔backend protocol beyond FUSE plus versioned serialization logic
+> in every backend. (If a future backend needs blob-style fidelity, it can be added as an
+> optional extension later; not here.)
 
-**Commit 5.1 [RED] — Sentry option parsing, clamps, coupling rule (tests)**
-- `fusefs_test.go` (create if absent) / extend existing: test `parseOptions` for the three
-  new options and the clamps and coupling rule (see 5.2 for semantics). Values above
-  ceilings **clamp, not error**. Test the `max_read` upper clamp and the
-  `max_read ≤ reply_buf_max − SizeOfFUSEHeaderOut` coupling.
-- Fails: fields/clamps/coupling don't exist yet.
+How it works:
+- **Save:** quiesce the connection — stop admitting new requests (reuse the Stage 6
+  admission machinery / `connected` handling), drain in-flight requests (wait with a
+  timeout; on timeout, **fail the checkpoint**, don't kill requests), then save: the mount
+  options (including the UDS source path), negotiated INIT parameters, the dentry/inode
+  tree (paths, nodeids, open handles with their flags). The host FD, reader goroutine,
+  pools, and gate are `nosave` and reconstructed.
+- **Restore:** runsc re-dials the UDS (same path from the saved mount source; allow an
+  override in the restore spec like gofer allows new FDs) and donates a fresh FD via the
+  restore fdmap (`configureRestore`, `vfs.go` ~1510). The Sentry implements
+  `vfs.FilesystemImplSaveRestoreExtension` for fusefs: `CompleteRestore` takes the FD,
+  re-runs FUSE_INIT (re-negotiate; **fail restore** if the new negotiation is incompatible
+  with saved assumptions, e.g. maxWrite shrank below what saved state requires), then
+  re-LOOKUPs live dentries by path to obtain fresh nodeids and re-OPENs open handles to
+  obtain fresh Fh, rewriting both in place. FORGET bookkeeping resets (old lookup counts
+  belong to the dead session). Follow gofer's `PrepareSave` (purge non-reopenable cached
+  dentries) + `restoreDescendantsRecursive` shape.
+- **Backend contract (document in g3doc):** at restore the backend must be reachable at
+  the socket path and serve the same underlying data; nodeids and file handles do NOT need
+  to be stable across sessions (they are session-scoped and re-learned); a backend that
+  keeps per-handle state beyond what OPEN flags reconstruct will lose it. Files unlinked
+  while open cannot be re-looked-up by path — restore fails on them (same class of
+  limitation gofer handles via `restoreDeleted`; a fusefs analog can be scoped later if
+  needed).
 
-**Commit 5.2 [GREEN] — Sentry options + clamps + coupling**
-- `fusefs.go` `filesystemOptions`: add `maxInflight uint64` (mount opt `max_inflight`;
-  for host-FD mounts this replaces the hardcoded `maxActiveRequestsDefault`; device path
-  keeps its default), `replyBufMax uint32` (mount opt `reply_buf_max`, bytes — the
-  large-class ceiling), `replyBufConcurrency uint32` (mount opt `reply_buf_concurrency`).
-- Hard clamp constants near `fuseMinMaxRead`: `fuseMaxMaxInflight`, `fuseMaxReplyBuf`
-  (suggest 4 MiB), `fuseMaxReplyBufConcurrency`, plus a new **upper** clamp on `max_read`.
-  Parse → clamp → store for each. Provide sane built-in defaults.
-- Coupling rule at parse time: effective `max_read ≤ reply_buf_max − SizeOfFUSEHeaderOut`;
-  if they conflict, **clamp `max_read` down and log**. This guarantees `maxFrame`
-  (== `reply_buf_max`) can always hold a maximal READ reply, so a well-behaved backend never
-  trips teardown.
-- Thread `maxInflight` into `newFUSEConnectionOpts` (it sizes `maxActiveRequests` and
-  `fullQueueCh`) and `replyBufMax`/`replyBufConcurrency` into the pool + gate construction
-  (Stage 3 made these connection-scoped — wire the real values here instead of test
-  defaults). Redefine `maxFrame` as `reply_buf_max`.
-- Add `+checklocks` annotations for any new connection fields consistent with existing style.
-
-**Commit 5.3 [GREEN] — runsc global flags**
-- `runsc/config/config.go`: add `Config` fields with `flag:"fuse-max-inflight"`,
-  `flag:"fuse-reply-buf-max"`, `flag:"fuse-reply-buf-concurrency"` tags, host-wide defaults.
-- `runsc/config/flags.go`: register them. They must be accepted **identically by `create`
-  and `boot`** (that's how gVisor flags work).
-- Tests: extend the config flag round-trip tests if present.
-
-**Commit 5.4 [GREEN] — per-container OCI annotations**
-- `runsc/specutils`: constants `dev.gvisor.fuse.max-inflight`, `...reply-buf-max`,
-  `...reply-buf-concurrency`.
-- `runsc/boot/loader.go`: read them following the `specutils.AnnotationCPUFeatures` pattern
-  (~line 692), overriding the flag defaults for that container. Do NOT use the debug-only
-  `dev.gvisor.flag.<name>` override for the production surface.
-
-**Commit 5.5 [GREEN or ASK-FIRST] — deliver defaults to the Sentry**
-> **Open design question — resolve with the user before writing this commit.** The original
-> design assumed runsc *emits* the fusefs mount-option string (containing `fd=`) and that we
-> thread the three options into it. **In this tree the host-FD fuse mount is assembled by
-> the container's own userspace** (see `test/fuse_host/workload/workload.go`, which builds
-> `fd=%d,user_id=...,rootmode=...` and calls `mount -t fuse` itself). There is no `fd=`
-> fuse-mount assembly in `runsc/boot/`. So there is no runsc-emitted mount string to inject
-> into.
->
-> Therefore the runsc flag/annotation values must reach the Sentry another way. Preferred
-> approach (pending user confirmation): plumb the resolved per-container defaults through the
-> **boot `Config` already available to the Sentry**, and in `parseOptions`/
-> `getFilesystemHostFD` apply them as the **default** for any of the three options the mount
-> string did not specify — Sentry clamps still bound everything. This keeps the security
-> boundary in the Sentry and does not require rewriting a mount string that runsc doesn't
-> control. **Do not guess — confirm the mechanism with the user, then implement.**
-- Tests: annotation-override precedence (annotation beats flag, mount opt beats annotation,
-  clamp beats all); if `test/fuse_host/` e2e tests can host an integration test, extend them
-  rather than inventing a new harness.
-
-**Commit 5.6 [DOC] — document options and flags**
-- Document the new mount options (`max_inflight`, `reply_buf_max`, `reply_buf_concurrency`),
-  the runsc flags, the annotations, the `max_read`/`reply_buf_max` coupling rule, and the
-  RAM formula `8KB × max_inflight + reply_buf_max × reply_buf_concurrency` wherever fusefs
-  options are documented (`g3doc/user_guide/fuse.md`).
+Commit sketch (expand into proper [RED]/[GREEN] pairs — **present the expansion to the
+user for review before writing code for this stage**; it is the largest and subtlest):
+1. Quiesce/drain on save (uses Stage 6 machinery) + failing-save-on-timeout tests.
+2. Savable-state audit: make fusefs host-connection state stateify-correct (`nosave` the
+   transport bits, save options/negotiated params), delete the Stage 2.4 loud rejection,
+   replace the silent `afterLoad` deviceConn revert with host-aware reconstruction.
+3. runsc restore path: re-dial + fdmap donation for fuse mounts (rides `configureRestore`).
+4. `CompleteRestore`: re-INIT + compatibility validation.
+5. Replay walk: re-LOOKUP dentries / re-OPEN handles, rewrite nodeids/Fh.
+6. e2e: checkpoint/restore round-trip against the Stage 4 test backend (data intact across
+   restore, open FDs usable, failure cases: backend absent at restore, incompatible INIT).
 
 ---
 
 ## 4. Invariants — verify before EVERY commit
 
+- Code formatted (gofmt/goimports); all tests green except a [RED] commit's own new tests.
 - The device (`/dev/fuse`) path's observable behavior is unchanged. `Release()` is a no-op
   there; handlers stay transport-agnostic (they must not know which transport served them).
 - The `fuseConn` interface stays as-is unless a change is strictly required; if changed,
@@ -589,7 +749,8 @@ default.** Sentry clamps are the security boundary; runsc/annotation values are 
 - Invalid frame `Len` ⇒ connection death, never resync-and-continue.
 - Sentry-side clamps bound every externally supplied value; runsc/annotation values are
   untrusted input.
-- No new host syscalls from the Sentry — plain `read`/`write` only.
+- No new host syscalls from the Sentry — plain `read`/`write` only. (runsc CLI pre-boot
+  code may dial UDSes; the *Sentry* may not.)
 - `noReply` requests: no completion entry, no active-request slot, no admission gate.
 - Run new tests under `-race`; nogo/checklocks must pass; new `connection` fields carry
   `+checklocks` annotations matching existing style.
