@@ -232,6 +232,16 @@ type connection struct {
 	// the server.
 	maxActiveRequests uint64
 
+	// replyBufMax is the host-FD large-class reply-buffer ceiling in bytes, and
+	// therefore the maximum frame size the host reader will accept. Set at
+	// creation and immutable; only used by the host-FD transport.
+	replyBufMax uint32
+
+	// replyBufConcurrency bounds the number of concurrent large-class reply
+	// buffers on the host-FD path. Set at creation and immutable; only used by
+	// the host-FD transport.
+	replyBufConcurrency uint32
+
 	// minor version of the FUSE protocol.
 	// Negotiated and only set in INIT.
 	minor uint32
@@ -347,6 +357,16 @@ func newFUSEConnection(_ context.Context, fuseFD *DeviceFD, opts *filesystemOpti
 // newFUSEConnectionOpts creates a FUSE connection with the given options.
 // This is used by both the DeviceFD path and the host FD passthrough path.
 func newFUSEConnectionOpts(opts *filesystemOptions) (*connection, error) {
+	// Fall back to defaults for the host-FD memory options if a caller (e.g. the
+	// device path or a test) left them unset, so that maxFrame is always sane.
+	replyBufMax := opts.replyBufMax
+	if replyBufMax == 0 {
+		replyBufMax = fuseDefaultReplyBufMax
+	}
+	replyBufConcurrency := opts.replyBufConcurrency
+	if replyBufConcurrency == 0 {
+		replyBufConcurrency = fuseDefaultReplyBufConcurrency
+	}
 	conn := &connection{
 		completions:              make(map[linux.FUSEOpID]*futureResponse),
 		fullQueueCh:              make(chan struct{}, opts.maxActiveRequests),
@@ -355,6 +375,8 @@ func newFUSEConnectionOpts(opts *filesystemOptions) (*connection, error) {
 		maxRead:                  opts.maxRead,
 		maxPages:                 fuseDefaultMaxPagesPerReq,
 		maxActiveRequests:        opts.maxActiveRequests,
+		replyBufMax:              replyBufMax,
+		replyBufConcurrency:      replyBufConcurrency,
 		initializedChan:          make(chan struct{}),
 		connected:                true,
 	}

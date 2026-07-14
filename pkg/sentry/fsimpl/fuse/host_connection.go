@@ -78,11 +78,13 @@ func (hc *hostConnection) startReader() {
 	go hc.readLoop()
 }
 
-// maxFrame is the largest reply frame the reader will accept, in bytes. A
-// well-behaved backend never exceeds this because a READ reply is bounded by
-// the negotiated max_read (plus the fixed header).
+// maxFrame is the largest reply frame the reader will accept, in bytes. It is
+// the large-class reply-buffer ceiling (reply_buf_max). The max_read/reply_buf_max
+// coupling rule (see clampHostFDOptions) guarantees a maximal READ reply
+// (max_read payload + header) always fits, so a well-behaved backend never trips
+// the teardown path.
 func (hc *hostConnection) maxFrame() uint64 {
-	return uint64(hc.conn.maxRead) + uint64(linux.SizeOfFUSEHeaderOut)
+	return uint64(hc.conn.replyBufMax)
 }
 
 // readFD performs a single read, retrying on EINTR.

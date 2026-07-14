@@ -242,6 +242,11 @@ func (fsType FilesystemType) getFilesystemHostFD(ctx context.Context, vfsObj *vf
 		return nil, nil, err
 	}
 
+	// Apply the host-FD-specific clamps and use max_inflight as the active
+	// request bound (the device path keeps maxActiveRequestsDefault).
+	clampHostFDOptions(ctx, fsopts)
+	fsopts.maxActiveRequests = fsopts.maxInflight
+
 	conn, err := newFUSEConnectionOpts(fsopts)
 	if err != nil {
 		unix.Close(dupFD)
@@ -360,6 +365,42 @@ func parseOptions(ctx context.Context, creds *auth.Credentials, data string) (*f
 		fsopts.maxRead = uint32(maxRead)
 	}
 
+	// Parse the host-FD memory-limit options. Values are untrusted (they may
+	// originate from a container annotation) and are clamped to hard Sentry-side
+	// bounds; out-of-range numeric values clamp rather than error.
+	fsopts.maxInflight = maxActiveRequestsDefault
+	if v, ok := mopts["max_inflight"]; ok {
+		delete(mopts, "max_inflight")
+		n, err := strconv.ParseUint(v, 10, 64)
+		if err != nil {
+			log.Warningf("fusefs.parseOptions: invalid max_inflight: %s", v)
+			return nil, 0, linuxerr.EINVAL
+		}
+		fsopts.maxInflight = clampUint64(n, 1, fuseMaxMaxInflight)
+	}
+
+	fsopts.replyBufMax = fuseDefaultReplyBufMax
+	if v, ok := mopts["reply_buf_max"]; ok {
+		delete(mopts, "reply_buf_max")
+		n, err := strconv.ParseUint(v, 10, 64)
+		if err != nil {
+			log.Warningf("fusefs.parseOptions: invalid reply_buf_max: %s", v)
+			return nil, 0, linuxerr.EINVAL
+		}
+		fsopts.replyBufMax = uint32(clampUint64(n, uint64(fuseMinReplyBuf), fuseMaxReplyBuf))
+	}
+
+	fsopts.replyBufConcurrency = fuseDefaultReplyBufConcurrency
+	if v, ok := mopts["reply_buf_concurrency"]; ok {
+		delete(mopts, "reply_buf_concurrency")
+		n, err := strconv.ParseUint(v, 10, 64)
+		if err != nil {
+			log.Warningf("fusefs.parseOptions: invalid reply_buf_concurrency: %s", v)
+			return nil, 0, linuxerr.EINVAL
+		}
+		fsopts.replyBufConcurrency = uint32(clampUint64(n, 1, fuseMaxReplyBufConcurrency))
+	}
+
 	// Parse 'default_permissions'.
 	if _, ok := mopts["default_permissions"]; ok {
 		delete(mopts, "default_permissions")
@@ -381,13 +422,35 @@ func parseOptions(ctx context.Context, creds *auth.Credentials, data string) (*f
 	return fsopts, int32(deviceDescriptor), nil
 }
 
+// clampUint64 clamps v to the inclusive range [lo, hi].
+func clampUint64(v, lo, hi uint64) uint64 {
+	if v < lo {
+		return lo
+	}
+	if v > hi {
+		return hi
+	}
+	return v
+}
+
 // clampHostFDOptions applies the host-FD-specific clamps to fsopts: the upper
 // bound on max_read and the coupling rule tying max_read to reply_buf_max. It is
 // applied only when building a host-FD connection, so the device path's max_read
 // behavior is unchanged.
-//
-// TODO: implemented in the following commit.
 func clampHostFDOptions(ctx context.Context, fsopts *filesystemOptions) {
+	if fsopts.maxRead > fuseMaxMaxRead {
+		fsopts.maxRead = fuseMaxMaxRead
+	}
+	// Coupling rule: reply_buf_max (the large-class ceiling, and therefore the
+	// framer's maximum frame size) must be able to hold a maximal READ reply,
+	// i.e. a max_read-byte payload plus the fixed header. Otherwise a
+	// well-behaved backend honoring the negotiated read size could produce a
+	// frame that trips the kill-connection path. Clamp max_read down to fit.
+	maxByCoupling := fsopts.replyBufMax - uint32(linux.SizeOfFUSEHeaderOut)
+	if fsopts.maxRead > maxByCoupling {
+		ctx.Infof("fusefs: clamping max_read from %d to %d to fit reply_buf_max %d", fsopts.maxRead, maxByCoupling, fsopts.replyBufMax)
+		fsopts.maxRead = maxByCoupling
+	}
 }
 
 // newFUSEFilesystem creates a new FUSE filesystem.

@@ -442,8 +442,8 @@ func TestHostFramerLargeReply(t *testing.T) {
 	defer s.Destroy()
 	hc, serverFD, cleanup := newTestHostConnectionType(t, unix.SOCK_STREAM)
 	defer cleanup()
-	// Allow a large frame: raise maxRead well above the old 8 KB cap.
-	hc.conn.maxRead = 1 << 20
+	// maxFrame is reply_buf_max, which defaults to 1 MiB in the test connection,
+	// well above the old 8 KB cap.
 
 	creds := auth.CredentialsFromContext(s.Ctx)
 	zero := primitive.Uint32(0)
@@ -480,7 +480,7 @@ func TestHostFramerInvalidLenTearsDown(t *testing.T) {
 		length uint32
 	}{
 		{"len-below-header", 8},
-		{"len-above-maxframe", 5000}, // maxRead default in test conn is 4096.
+		{"len-above-maxframe", 2 << 20}, // > reply_buf_max (1 MiB) in the test conn.
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			s := setup(t)
