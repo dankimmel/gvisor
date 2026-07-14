@@ -133,6 +133,20 @@ func (hc *hostConnection) call(ctx context.Context, r *Request) (*Response, erro
 		hc.conn.mu.Unlock()
 		return nil, linuxerr.ECONNABORTED
 	}
+
+	// No-reply requests (e.g. FUSE_FORGET) never receive a response, so they
+	// must not register a completion or consume an active-request slot: nothing
+	// would ever clean them up. Write the request and return. This mirrors the
+	// device path, which removes noReply requests from the completions map when
+	// it dequeues them (see connection.read).
+	if r.noReply {
+		hc.conn.mu.Unlock()
+		if err := hc.writeRequest(r); err != nil {
+			return nil, err
+		}
+		return nil, nil
+	}
+
 	hc.conn.numActiveRequests++
 	fut := newFutureResponse(r)
 	hc.conn.completions[r.id] = fut
