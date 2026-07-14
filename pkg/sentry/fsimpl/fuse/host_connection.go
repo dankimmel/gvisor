@@ -15,6 +15,8 @@
 package fuse
 
 import (
+	"errors"
+
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
@@ -24,12 +26,17 @@ import (
 	"gvisor.dev/gvisor/pkg/sync"
 )
 
-var respBufPool = sync.Pool{
-	New: func() any {
-		b := make([]byte, linux.FUSE_MIN_READ_BUFFER)
-		return &b
-	},
-}
+// hostReadChunk is the size of a single read into the reader's accumulation
+// buffer while assembling a frame header.
+const hostReadChunk = 4096
+
+// errBadFrame indicates a FUSE reply frame whose header Len is invalid (below
+// the header size or above the negotiated maximum). FUSE stream framing has no
+// resync point, so this is unrecoverable: the reader tears the connection down.
+var errBadFrame = errors.New("fuse host connection: invalid frame length")
+
+// errReaderClosed indicates the peer closed the FD (EOF) mid-stream.
+var errReaderClosed = errors.New("fuse host connection: peer closed")
 
 // hostConnection implements fuseConn for the host FD passthrough path.
 // Instead of using the /dev/fuse device within the sandbox, it writes FUSE
@@ -48,6 +55,12 @@ type hostConnection struct {
 
 	// writeMu serializes write operations on hostFD.
 	writeMu sync.Mutex
+
+	// readBuf accumulates bytes read from hostFD that have not yet been consumed
+	// as a complete frame (a partial header, or the read-ahead remainder of a
+	// coalesced read). It is owned exclusively by the reader goroutine (and by
+	// InitSend before the reader is started), so it needs no lock.
+	readBuf []byte
 }
 
 // newHostConnection creates a hostConnection that communicates over hostFD.
@@ -65,61 +78,164 @@ func (hc *hostConnection) startReader() {
 	go hc.readLoop()
 }
 
-// readLoop reads FUSE responses from the host FD and dispatches them to the
-// corresponding callers via the connection's completions map.
-func (hc *hostConnection) readLoop() {
+// maxFrame is the largest reply frame the reader will accept, in bytes. A
+// well-behaved backend never exceeds this because a READ reply is bounded by
+// the negotiated max_read (plus the fixed header).
+func (hc *hostConnection) maxFrame() uint64 {
+	return uint64(hc.conn.maxRead) + uint64(linux.SizeOfFUSEHeaderOut)
+}
+
+// readFD performs a single read, retrying on EINTR.
+func readFD(fd int, p []byte) (int, error) {
 	for {
-		bufp := respBufPool.Get().(*[]byte)
-		respBuf := (*bufp)[:linux.FUSE_MIN_READ_BUFFER]
-
-		n, err := unix.Read(int(hc.hostFD), respBuf)
-		if err != nil || n == 0 {
-			respBufPool.Put(bufp)
-			hc.abortPending()
-			return
-		}
-		if n < int(linux.SizeOfFUSEHeaderOut) {
-			respBufPool.Put(bufp)
-			log.Warningf("fuse host connection: short read %d bytes, need at least %d", n, linux.SizeOfFUSEHeaderOut)
+		n, err := unix.Read(fd, p)
+		if err == unix.EINTR {
 			continue
 		}
-
-		var hdr linux.FUSEHeaderOut
-		hdr.UnmarshalUnsafe(respBuf[:linux.SizeOfFUSEHeaderOut])
-
-		if hdr.Len > uint32(n) {
-			respBufPool.Put(bufp)
-			log.Warningf("fuse host connection: response says %d bytes but only read %d", hdr.Len, n)
-			continue
-		}
-
-		hc.conn.mu.Lock()
-		fut, ok := hc.conn.completions[hdr.Unique]
-		if ok {
-			delete(hc.conn.completions, hdr.Unique)
-			fut.hdr = &hdr
-			copy(fut.buf[:], respBuf[:hdr.Len])
-			fut.data = fut.buf[:hdr.Len]
-			select {
-			case hc.conn.fullQueueCh <- struct{}{}:
-			default:
-			}
-			hc.conn.numActiveRequests--
-			close(fut.ch)
-		}
-		hc.conn.mu.Unlock()
-		respBufPool.Put(bufp)
+		return n, err
 	}
 }
 
-// abortPending wakes all callers blocked on a response with closed channels.
-// Called when the reader goroutine exits due to an error or FD closure.
+// fillReadBuf reads up to hostReadChunk bytes from the host FD and appends them
+// to the accumulation buffer.
+func (hc *hostConnection) fillReadBuf() error {
+	var scratch [hostReadChunk]byte
+	n, err := readFD(int(hc.hostFD), scratch[:])
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return errReaderClosed
+	}
+	hc.readBuf = append(hc.readBuf, scratch[:n]...)
+	return nil
+}
+
+// readFrame reads a single complete FUSE reply frame from the host FD. It
+// reassembles the frame from the byte stream using the header's self-describing
+// Len, and returns the parsed header plus a newly allocated buffer holding the
+// whole frame (header + payload). Bytes read past the frame boundary are
+// retained in hc.readBuf for the next frame.
+//
+// On an invalid Len it returns errBadFrame; the caller must tear the connection
+// down rather than attempt to resync, as FUSE stream framing has no resync
+// point.
+func (hc *hostConnection) readFrame() (linux.FUSEHeaderOut, []byte, error) {
+	// Ensure the fixed-size header is fully buffered.
+	for uint32(len(hc.readBuf)) < linux.SizeOfFUSEHeaderOut {
+		if err := hc.fillReadBuf(); err != nil {
+			return linux.FUSEHeaderOut{}, nil, err
+		}
+	}
+
+	var hdr linux.FUSEHeaderOut
+	hdr.UnmarshalUnsafe(hc.readBuf[:linux.SizeOfFUSEHeaderOut])
+
+	if hdr.Len < linux.SizeOfFUSEHeaderOut || uint64(hdr.Len) > hc.maxFrame() {
+		return hdr, nil, errBadFrame
+	}
+	frameLen := int(hdr.Len)
+
+	if len(hc.readBuf) >= frameLen {
+		// The whole frame (and possibly the start of the next) is buffered.
+		buf := make([]byte, frameLen)
+		copy(buf, hc.readBuf)
+		if leftover := len(hc.readBuf) - frameLen; leftover > 0 {
+			rem := make([]byte, leftover)
+			copy(rem, hc.readBuf[frameLen:])
+			hc.readBuf = rem
+		} else {
+			hc.readBuf = hc.readBuf[:0]
+		}
+		return hdr, buf, nil
+	}
+
+	// Only part of the frame is buffered. Read the remainder directly into the
+	// frame buffer, bounded by frameLen so we never over-read into the next
+	// frame.
+	buf := make([]byte, frameLen)
+	n := copy(buf, hc.readBuf)
+	hc.readBuf = hc.readBuf[:0]
+	for n < frameLen {
+		r, err := readFD(int(hc.hostFD), buf[n:])
+		if err != nil {
+			return hdr, nil, err
+		}
+		if r == 0 {
+			return hdr, nil, errReaderClosed
+		}
+		n += r
+	}
+	return hdr, buf, nil
+}
+
+// readLoop reads FUSE reply frames from the host FD and dispatches them to the
+// corresponding callers via the connection's completions map. It exits (tearing
+// the connection down) on any read error or an invalid frame.
+func (hc *hostConnection) readLoop() {
+	for {
+		hdr, buf, err := hc.readFrame()
+		if err != nil {
+			if errors.Is(err, errBadFrame) {
+				log.Warningf("fuse host connection: invalid frame length %d (max %d); tearing down connection", hdr.Len, hc.maxFrame())
+			} else {
+				log.Debugf("fuse host connection: reader exiting: %v", err)
+			}
+			hc.abortPending()
+			return
+		}
+		hc.dispatchReply(hdr, buf)
+	}
+}
+
+// dispatchReply routes a single framed reply to its waiting caller. Buffer
+// ownership transfers to the future; no payload is copied under conn.mu.
+func (hc *hostConnection) dispatchReply(hdr linux.FUSEHeaderOut, buf []byte) {
+	// Server-initiated notifications (header Unique == 0, notify code in Error)
+	// are not supported on this path: consume and discard.
+	if hdr.Unique == 0 {
+		log.Warningf("fuse host connection: discarding unsupported server notification (code %d)", hdr.Error)
+		return
+	}
+
+	hc.conn.mu.Lock()
+	fut, ok := hc.conn.completions[hdr.Unique]
+	if !ok {
+		hc.conn.mu.Unlock()
+		// A late reply for a request that was canceled/interrupted and already
+		// removed from the map. Drop it.
+		log.Debugf("fuse host connection: dropping reply for unknown request %d", hdr.Unique)
+		return
+	}
+	delete(hc.conn.completions, hdr.Unique)
+	fut.hdr = &hdr
+	fut.data = buf
+	select {
+	case hc.conn.fullQueueCh <- struct{}{}:
+	default:
+	}
+	hc.conn.numActiveRequests--
+	close(fut.ch)
+	hc.conn.mu.Unlock()
+}
+
+// abortPending tears the connection down and wakes all callers blocked on a
+// response, delivering ECONNABORTED. Called when the reader goroutine exits due
+// to an error, an invalid frame, or FD closure.
 func (hc *hostConnection) abortPending() {
 	hc.conn.mu.Lock()
 	defer hc.conn.mu.Unlock()
+	hc.conn.connected = false
 	for id, fut := range hc.conn.completions {
 		delete(hc.conn.completions, id)
 		hc.conn.numActiveRequests--
+		// Synthesize an ECONNABORTED reply header so a caller blocked in
+		// resolve() sees an error instead of dereferencing a nil fut.hdr.
+		fut.hdr = &linux.FUSEHeaderOut{
+			Len:    linux.SizeOfFUSEHeaderOut,
+			Error:  -int32(unix.ECONNABORTED),
+			Unique: id,
+		}
 		close(fut.ch)
 	}
 }
@@ -235,22 +351,21 @@ func (hc *hostConnection) InitSend(creds *auth.Credentials, pid uint32, hasSysAd
 		return err
 	}
 
-	respBuf := make([]byte, linux.FUSE_MIN_READ_BUFFER)
-	n, err := unix.Read(int(hc.hostFD), respBuf)
+	// Read the INIT reply through the same framer the reader goroutine uses, so
+	// there is a single wire parser. INIT replies fit the small class.
+	hdr, buf, err := hc.readFrame()
 	if err != nil {
 		return err
 	}
-	if n < int(linux.SizeOfFUSEHeaderOut) {
+	if hdr.Unique != req.hdr.Unique {
+		log.Warningf("fuse host connection: unexpected reply during INIT (unique %d, want %d)", hdr.Unique, req.hdr.Unique)
 		return linuxerr.EIO
 	}
-
-	var hdr linux.FUSEHeaderOut
-	hdr.UnmarshalUnsafe(respBuf[:linux.SizeOfFUSEHeaderOut])
 
 	res := &Response{
 		opcode: linux.FUSE_INIT,
 		hdr:    hdr,
-		data:   respBuf[:hdr.Len],
+		data:   buf,
 	}
 
 	hc.conn.mu.Lock()
