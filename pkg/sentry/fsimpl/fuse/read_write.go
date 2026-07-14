@@ -30,7 +30,11 @@ import (
 // This is used for the general purpose reading.
 // We do not support direct IO (which read the exact number of bytes)
 // at this moment.
-func (fs *filesystem) ReadInPages(ctx context.Context, fd *regularFileFD, off uint64, size uint32) ([][]byte, uint32, error) {
+//
+// The returned buffers alias the reply payloads, so they are backed by the
+// returned reply objects; the caller must call Release on each after it has
+// copied the data out. ReadInPages releases them itself on its own error paths.
+func (fs *filesystem) ReadInPages(ctx context.Context, fd *regularFileFD, off uint64, size uint32) ([][]byte, []*Response, uint32, error) {
 	attributeVersion := fs.conn.attributeVersion.Load()
 
 	// Round up to a multiple of page size.
@@ -43,7 +47,13 @@ func (fs *filesystem) ReadInPages(ctx context.Context, fd *regularFileFD, off ui
 	}
 
 	var outs [][]byte
+	var ress []*Response
 	var sizeRead uint32
+	releaseAll := func() {
+		for _, r := range ress {
+			r.Release()
+		}
+	}
 
 	// readSize is a multiple of hostarch.PageSize.
 	// Always request bytes as a multiple of pages.
@@ -73,7 +83,8 @@ func (fs *filesystem) ReadInPages(ctx context.Context, fd *regularFileFD, off ui
 		// TODO(gvisor.dev/issue/3247): support async read.
 		res, err := fd.inode().callRaw(ctx, linux.FUSE_READ, &in)
 		if err != nil {
-			return nil, 0, err
+			releaseAll()
+			return nil, nil, 0, err
 		}
 
 		// Not enough bytes in response,
@@ -83,14 +94,18 @@ func (fs *filesystem) ReadInPages(ctx context.Context, fd *regularFileFD, off ui
 		if len(res.data) <= res.hdr.SizeBytes() {
 			// We treat both case as EOF here for now
 			// since there is no reliable way to detect
-			// the over-short hdr case.
+			// the over-short hdr case. This reply is not returned to the
+			// caller, so release it here.
+			res.Release()
 			break
 		}
 
-		// Directly using the slice to avoid extra copy.
+		// Directly using the slice to avoid extra copy. The reply object is
+		// returned to the caller, which releases it after copy-out.
 		out := res.data[res.hdr.SizeBytes():]
 
 		outs = append(outs, out)
+		ress = append(ress, res)
 		sizeRead += uint32(len(out))
 
 		pagesRead += pagesCanRead
@@ -100,10 +115,10 @@ func (fs *filesystem) ReadInPages(ctx context.Context, fd *regularFileFD, off ui
 
 	// No bytes returned: offset >= EOF.
 	if len(outs) == 0 {
-		return nil, 0, io.EOF
+		return nil, nil, 0, io.EOF
 	}
 
-	return outs, sizeRead, nil
+	return outs, ress, sizeRead, nil
 }
 
 // ReadCallback updates several information after receiving a read response.

@@ -157,10 +157,17 @@ func (fd *regularFileFD) PRead(ctx context.Context, dst usermem.IOSequence, offs
 		size = int64(fileSize) - offset
 	}
 
-	buffers, n, err := inode.fs.ReadInPages(ctx, fd, uint64(offset), uint32(size))
+	buffers, ress, n, err := inode.fs.ReadInPages(ctx, fd, uint64(offset), uint32(size))
 	if err != nil {
 		return 0, err
 	}
+	// The buffers alias pooled reply payloads; release them only after the data
+	// has been copied out to dst below (on every exit path).
+	defer func() {
+		for _, res := range ress {
+			res.Release()
+		}
+	}()
 
 	// TODO(gvisor.dev/issue/3237): support indirect IO (e.g. caching),
 	// store the bytes that were read ahead.

@@ -48,6 +48,11 @@ const smallBufSize = int(linux.FUSE_MIN_READ_BUFFER)
 // configured ceiling).
 const largeBufChunk = 64 * 1024
 
+// poisonByte is written over a released buffer under debugFUSEBuffers, so a
+// use-after-release corrupts recognizably instead of silently returning stale
+// data.
+const poisonByte = 0x5a
+
 // pooledBuf is a reply buffer drawn from a bufferPool. Ownership is single: the
 // reader owns it until it either transfers it to a live future (whose opcode
 // handler later releases it) or releases it itself. A missed release is a
@@ -159,6 +164,13 @@ func (pb *pooledBuf) release() {
 	bp := pb.pool
 	pb.disarmFinalizer()
 	pb.bytes = pb.bytes[:cap(pb.bytes)]
+	if debugFUSEBuffers {
+		// Poison the buffer so any read of an aliased payload after release
+		// (e.g. a READ whose data was not copied out first) is caught.
+		for i := range pb.bytes {
+			pb.bytes[i] = poisonByte
+		}
+	}
 	switch pb.class {
 	case bufClassSmall:
 		bp.smallReleased.Add(1)
