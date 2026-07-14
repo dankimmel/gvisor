@@ -30,9 +30,15 @@ import (
 // Returns the hostConnection, the server-side FD, and a cleanup function.
 // The connection is pre-initialized and the reader goroutine is started.
 func newTestHostConnection(t *testing.T) (*hostConnection, int, func()) {
+	return newTestHostConnectionType(t, unix.SOCK_SEQPACKET)
+}
+
+// newTestHostConnectionType is like newTestHostConnection but allows choosing
+// the socketpair type (e.g. SOCK_STREAM to exercise the stream framer).
+func newTestHostConnectionType(t *testing.T, sockType int) (*hostConnection, int, func()) {
 	t.Helper()
 
-	fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_SEQPACKET, 0)
+	fds, err := unix.Socketpair(unix.AF_UNIX, sockType, 0)
 	if err != nil {
 		t.Fatalf("Socketpair: %v", err)
 	}
