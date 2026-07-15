@@ -130,6 +130,24 @@ cmd.Run()
     validity timeouts returned on individual replies. Backends must not send
     `FUSE_NOTIFY_RETRIEVE`, which expects a reply that is never sent and would
     block the backend forever.
+*   **Checkpoint/restore (runsc-provisioned mounts only)**: A host-FD FUSE mount
+    provisioned by runsc can be checkpointed and restored. On restore, runsc
+    re-dials the backend socket and the Sentry replays its own state against the
+    fresh session: it re-issues `FUSE_LOOKUP` for every live path to re-learn
+    nodeids and re-issues `FUSE_OPEN`/`FUSE_OPENDIR` for every open handle to
+    re-learn file handles. The backend serializes nothing. Consequences a backend
+    must honor:
+    *   The backend must be reachable at the same socket path at restore time and
+        serve the same underlying data. Nodeids and file handles are
+        session-scoped and re-learned, so they need not be stable across restarts.
+    *   Restore re-binds by **path**: a file replaced at the same path between
+        checkpoint and restore silently binds to the new file. Treat backend data
+        as consistent across the checkpoint/restore gap.
+    *   A file unlinked while still open cannot be re-looked-up by path, so restore
+        fails on it.
+    *   An in-container `mount -t fuse -o fd=N` (not runsc-provisioned) has no
+        checkpoint identity and cannot be checkpointed; its checkpoint fails
+        cleanly.
 
 ## In-Sandbox FUSE
 

@@ -42,14 +42,26 @@ gofmt-clean and hand-checked against the real APIs.
 - **Stage 6 — admission control + interruption ownership:** DONE (shared
   `waitForSlot`, host gate, abort drain via `fullQueueCh` close, interruption
   ownership rule, interruptible-context tests).
-- **Stage 7 — checkpoint/restore via replay:** GROUNDWORK LANDED (`drainForSave` +
-  test). The replay restore itself is specified below but intentionally NOT written
-  blind: it manipulates stateify + the VFS restore machinery, a bug corrupts restored
-  filesystems *silently*, it can't be harness-validated, and it is all-or-nothing (a
-  partial implementation that lifts the Stage 2.4 rejection yields save-but-corrupt-
-  restore, strictly worse than today). Do it with working CI + a checkpoint/restore
-  review. Concrete executable breakdown (RED/GREEN each; lift the rejection only in the
-  final commit):
+- **Stage 7 — checkpoint/restore via replay:** IMPLEMENTED (root container; unverified
+  — CI + a checkpoint/restore review are strongly advised before relying on it). What
+  landed: `drainForSave`; a `fuse.InternalFilesystemOptions{UniqueID}` emitted by
+  `getMountNameAndOptions` and stored on the filesystem; `connection.isHostConn` so
+  `afterLoad` leaves the transport for `CompleteRestore` to rebuild; a root-dentry
+  reference and an `openFDs` registry (register on Open, unregister on Release); the
+  `vfs.FilesystemImplSaveRestoreExtension` (`PrepareSave` drains, `CompleteRestore`
+  pulls the fresh FD from the restore FD map by `UniqueID`, rebuilds the
+  `hostConnection`, re-runs INIT with a maxWrite-compatibility check, then
+  `restoreInodeTree` re-LOOKUPs nodeids and `reopenFDs` re-OPENs handles); and removal
+  of the `beforeSave` rejection. The runsc restore FD-donation needed no new code —
+  restore re-creates the sandbox through the same `container.New` path, and
+  `configureRestore`'s generic `goferFD` branch already keys the FD by
+  `ResourceID{ContainerName, Path}` = the mount's `UniqueID`. Un-provisioned
+  in-container host mounts (no `UniqueID`) still fail `PrepareSave` cleanly.
+
+  NOT done: subcontainer restore (needs the controller-RPC FD routing, same follow-up as
+  create-time subcontainer support); an e2e checkpoint/restore test in `test/fuse_host/`
+  (needs a running sandbox — write it with CI). The original executable breakdown is
+  kept below for reference.
 
   1. **Mount identity + FD map key.** In `getMountNameAndOptions`'s fuse case set
      `internalData = fuse.InternalFilesystemOptions{UniqueID: checkpoint.ResourceID{
