@@ -15,11 +15,16 @@
 package boot
 
 import (
+	"os"
 	"slices"
+	"strings"
 	"testing"
 
 	specs "github.com/opencontainers/runtime-spec/specs-go"
+	"gvisor.dev/gvisor/pkg/fd"
+	"gvisor.dev/gvisor/pkg/sentry/fsimpl/fuse"
 	"gvisor.dev/gvisor/runsc/config"
+	"gvisor.dev/gvisor/runsc/specutils"
 )
 
 func TestGetMountAccessType(t *testing.T) {
@@ -136,6 +141,66 @@ func TestGoferMountDataDirectFS(t *testing.T) {
 				t.Errorf("directfs option present = %t, want %t (opts=%v)", gotEnabled, tc.wantEnabled, opts)
 			}
 		})
+	}
+}
+
+func TestGetMountNameAndOptionsFUSE(t *testing.T) {
+	// A pipe FD stands in for the donated backend socket FD.
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe: %v", err)
+	}
+	defer r.Close()
+	defer w.Close()
+
+	conf := &config.Config{
+		FUSEMaxInflight:         9999,
+		FUSEReplyBufMax:         262144,
+		FUSEReplyBufConcurrency: 8,
+	}
+	// A container annotation overrides the flag default for max_inflight.
+	spec := &specs.Spec{
+		Annotations: map[string]string{
+			specutils.AnnotationFUSEMaxInflight: "500",
+		},
+	}
+	m := &mountInfo{
+		mount:   &specs.Mount{Type: fuse.Name, Destination: "/mnt/fuse"},
+		goferFD: fd.New(int(r.Fd())),
+	}
+
+	fsName, opts, err := getMountNameAndOptions(spec, conf, m, "", "cont", "cid", nil)
+	if err != nil {
+		t.Fatalf("getMountNameAndOptions: %v", err)
+	}
+	if fsName != fuse.Name {
+		t.Errorf("fsName = %q, want %q", fsName, fuse.Name)
+	}
+	if !opts.GetFilesystemOptions.InternalMount {
+		t.Error("InternalMount not set for a fuse mount")
+	}
+	data := opts.GetFilesystemOptions.Data
+	for _, want := range []string{
+		"host_fd=",
+		"user_id=0",
+		"group_id=0",
+		"rootmode=",
+		"max_inflight=500", // annotation override, not the flag default
+		"reply_buf_max=262144",
+		"reply_buf_concurrency=8",
+	} {
+		if !strings.Contains(data, want) {
+			t.Errorf("mount data %q missing %q", data, want)
+		}
+	}
+}
+
+func TestGetMountNameAndOptionsFUSENoFD(t *testing.T) {
+	conf := &config.Config{}
+	spec := &specs.Spec{}
+	m := &mountInfo{mount: &specs.Mount{Type: fuse.Name, Destination: "/mnt/fuse"}}
+	if _, _, err := getMountNameAndOptions(spec, conf, m, "", "cont", "cid", nil); err == nil {
+		t.Error("getMountNameAndOptions for a fuse mount without an FD: got nil error, want failure")
 	}
 }
 

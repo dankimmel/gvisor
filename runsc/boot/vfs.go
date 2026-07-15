@@ -1078,6 +1078,23 @@ func getMountNameAndOptions(spec *specs.Spec, conf *config.Config, m *mountInfo,
 			},
 		}
 
+	case fuse.Name:
+		// A runsc-provisioned host-FD FUSE mount: the connected backend socket FD
+		// was dialed and donated by the runsc CLI. Emit it as host_fd (an internal
+		// raw-FD option) along with the resolved per-container memory limits; the
+		// Sentry re-clamps every value.
+		if m.goferFD == nil {
+			return "", nil, fmt.Errorf("fuse mount requires a backend connection FD")
+		}
+		limits := specutils.FUSEMemoryLimitsFromAnnotations(spec.Annotations, containerName, specutils.FUSEMemoryLimits{
+			MaxInflight:         conf.FUSEMaxInflight,
+			ReplyBufMax:         conf.FUSEReplyBufMax,
+			ReplyBufConcurrency: conf.FUSEReplyBufConcurrency,
+		})
+		// Synthesize the mandatory options: container root uid/gid and a directory
+		// rootmode. The backend supplies real attributes via GETATTR.
+		data = []string{specutils.FUSEMountData(m.goferFD.Release(), 0, 0, uint32(linux.S_IFDIR|0o755), limits)}
+
 	default:
 		log.Warningf("ignoring unknown filesystem type %q", m.mount.Type)
 		return "", nil, nil
