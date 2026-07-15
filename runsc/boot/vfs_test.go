@@ -179,6 +179,13 @@ func TestGetMountNameAndOptionsFUSE(t *testing.T) {
 	if !opts.GetFilesystemOptions.InternalMount {
 		t.Error("InternalMount not set for a fuse mount")
 	}
+	iopts, ok := opts.GetFilesystemOptions.InternalData.(fuse.InternalFilesystemOptions)
+	if !ok {
+		t.Fatalf("InternalData = %T, want fuse.InternalFilesystemOptions", opts.GetFilesystemOptions.InternalData)
+	}
+	if iopts.UniqueID.Path != "/mnt/fuse" || iopts.UniqueID.ContainerName != "cont" {
+		t.Errorf("UniqueID = %+v, want {ContainerName: cont, Path: /mnt/fuse}", iopts.UniqueID)
+	}
 	data := opts.GetFilesystemOptions.Data
 	for _, want := range []string{
 		"host_fd=",

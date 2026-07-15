@@ -88,6 +88,13 @@ type connection struct {
 	// is a *deviceConn; for host passthrough this is a *hostConnection.
 	fuseConn fuseConn `state:"nosave"`
 
+	// isHostConn records that this connection uses the host-FD transport. On
+	// restore, the transport (host FD, reader goroutine, pools) is not saved, so
+	// afterLoad leaves fuseConn nil and the filesystem's CompleteRestore rebuilds
+	// a hostConnection against a freshly re-dialed backend FD. False for the
+	// device path, which afterLoad restores directly.
+	isHostConn bool
+
 	// We target FUSE 7.23.
 	// The following FUSE_INIT flags are currently unsupported by this implementation:
 	//	- FUSE_EXPORT_SUPPORT

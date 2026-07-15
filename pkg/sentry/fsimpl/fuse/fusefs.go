@@ -24,6 +24,7 @@ import (
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/log"
+	"gvisor.dev/gvisor/pkg/sentry/checkpoint"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/kernfs"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
@@ -68,6 +69,16 @@ const (
 //
 // +stateify savable
 type FilesystemType struct{}
+
+// InternalFilesystemOptions may be passed as
+// vfs.GetFilesystemOptions.InternalData to a runsc-provisioned host-FD FUSE
+// mount. UniqueID carries the checkpoint identity used to match a freshly
+// re-dialed backend FD on restore.
+//
+// +stateify savable
+type InternalFilesystemOptions struct {
+	UniqueID checkpoint.ResourceID
+}
 
 // +stateify savable
 type filesystemOptions struct {
@@ -142,6 +153,11 @@ type filesystem struct {
 
 	// clock is a real-time clock used to set timestamps in file operations.
 	clock ktime.Clock
+
+	// uniqueID identifies a host-FD mount across checkpoint/restore; it keys the
+	// fresh backend FD in the restore FD map. Empty for the device path and for
+	// host mounts not provisioned by runsc (which cannot be restored).
+	uniqueID checkpoint.ResourceID
 }
 
 // Name implements vfs.FilesystemType.Name.
@@ -164,6 +180,12 @@ func (fsType FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 		return nil, nil, err
 	}
 
+	// A runsc-provisioned mount carries a checkpoint identity for restore.
+	var uniqueID checkpoint.ResourceID
+	if iopts, ok := opts.InternalData.(InternalFilesystemOptions); ok {
+		uniqueID = iopts.UniqueID
+	}
+
 	kernelTask := kernel.TaskFromContext(ctx)
 
 	// A runsc-provisioned mount carries a raw Sentry-process host FD in host_fd
@@ -177,7 +199,7 @@ func (fsType FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 		// getFilesystemHostFD dups the FD; we own the donated original, so close
 		// it once the connection has its own copy.
 		defer unix.Close(fsopts.bootHostFD)
-		return fsType.getFilesystemHostFD(ctx, vfsObj, creds, kernelTask, int32(fsopts.bootHostFD), devMinor, fsopts)
+		return fsType.getFilesystemHostFD(ctx, vfsObj, creds, kernelTask, int32(fsopts.bootHostFD), devMinor, fsopts, uniqueID)
 	}
 
 	if kernelTask == nil {
@@ -213,7 +235,7 @@ func (fsType FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 		return nil, nil, linuxerr.EINVAL
 	}
 
-	return fsType.getFilesystemHostFD(ctx, vfsObj, creds, kernelTask, int32(rawHostFD), devMinor, fsopts)
+	return fsType.getFilesystemHostFD(ctx, vfsObj, creds, kernelTask, int32(rawHostFD), devMinor, fsopts, uniqueID)
 }
 
 // getFilesystemDeviceFD creates a FUSE filesystem backed by an in-sandbox
@@ -244,7 +266,7 @@ func (fsType FilesystemType) getFilesystemDeviceFD(ctx context.Context, vfsObj *
 
 // getFilesystemHostFD creates a FUSE filesystem that communicates with a FUSE
 // server running on the host via a host file descriptor.
-func (fsType FilesystemType) getFilesystemHostFD(ctx context.Context, vfsObj *vfs.VirtualFilesystem, creds *auth.Credentials, kernelTask *kernel.Task, hostFD int32, devMinor uint32, fsopts *filesystemOptions) (*vfs.Filesystem, *vfs.Dentry, error) {
+func (fsType FilesystemType) getFilesystemHostFD(ctx context.Context, vfsObj *vfs.VirtualFilesystem, creds *auth.Credentials, kernelTask *kernel.Task, hostFD int32, devMinor uint32, fsopts *filesystemOptions, uniqueID checkpoint.ResourceID) (*vfs.Filesystem, *vfs.Dentry, error) {
 	// Dup the host FD so that the FUSE connection owns its own copy.
 	// The original may be shared with or closed by the host import path
 	// (e.g. socket endpoints take ownership of the FD).
@@ -276,12 +298,14 @@ func (fsType FilesystemType) getFilesystemHostFD(ctx context.Context, vfsObj *vf
 
 	hostConn := newHostConnection(conn, int32(dupFD))
 	conn.fuseConn = hostConn
+	conn.isHostConn = true
 
 	fs := &filesystem{
 		devMinor: devMinor,
 		opts:     fsopts,
 		conn:     conn,
 		clock:    ktime.RealtimeClockFromContext(ctx),
+		uniqueID: uniqueID,
 	}
 	fs.VFSFilesystem().Init(vfsObj, &fsType, fs)
 

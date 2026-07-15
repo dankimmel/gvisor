@@ -33,7 +33,12 @@ func (conn *connection) beforeSave() {
 }
 
 func (conn *connection) afterLoad(context.Context) {
-	conn.fuseConn = &deviceConn{conn: conn}
+	// For host-FD connections, the transport is reconstructed by the
+	// filesystem's CompleteRestore (fresh FD, re-INIT, replay walk); leave
+	// fuseConn nil until then. The device path is restored directly.
+	if !conn.isHostConn {
+		conn.fuseConn = &deviceConn{conn: conn}
+	}
 }
 
 func (conn *connection) saveFullQueueCh() int {

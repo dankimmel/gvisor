@@ -1106,6 +1106,14 @@ func getMountNameAndOptions(spec *specs.Spec, conf *config.Config, m *mountInfo,
 		// Synthesize the mandatory options: container root uid/gid and a directory
 		// rootmode. The backend supplies real attributes via GETATTR.
 		data = []string{specutils.FUSEMountData(m.goferFD.Release(), 0, 0, uint32(linux.S_IFDIR|0o755), limits)}
+		// Carry a checkpoint identity so restore can match a freshly re-dialed
+		// backend FD to this mount.
+		internalData = fuse.InternalFilesystemOptions{
+			UniqueID: checkpoint.ResourceID{
+				ContainerName: containerName,
+				Path:          m.mount.Destination,
+			},
+		}
 
 	default:
 		log.Warningf("ignoring unknown filesystem type %q", m.mount.Type)
