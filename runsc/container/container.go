@@ -56,6 +56,9 @@ import (
 
 const cgroupParentAnnotation = "dev.gvisor.spec.cgroup-parent"
 
+// fuseDialTimeout bounds each runsc-provisioned host-FD FUSE backend dial.
+const fuseDialTimeout = 10 * time.Second
+
 // validateID validates the container id.
 func validateID(id string) error {
 	// See libcontainer/factory_linux.go.
@@ -373,6 +376,14 @@ func (c *Container) createRoot(conf *config.Config, args Args, sandboxID string)
 			return fmt.Errorf("cannot create gofer process: %w", err)
 		}
 
+		// Dial any runsc-provisioned host-FD FUSE backends and donate the
+		// connected sockets to the sandbox. Inert unless the feature is enabled
+		// (non-empty allowlist) and the spec has fuse mounts.
+		fuseMounts, err := specutils.DialFUSEMounts(args.Spec, conf.FUSEAllowedSocketDirs, fuseDialTimeout)
+		if err != nil {
+			return fmt.Errorf("dialing fuse backends: %w", err)
+		}
+
 		// Start a new sandbox for this container. Any errors after this point
 		// must destroy the container.
 		sandArgs := &sandbox.Args{
@@ -382,6 +393,7 @@ func (c *Container) createRoot(conf *config.Config, args Args, sandboxID string)
 			ConsoleSocket:       args.ConsoleSocket,
 			UserLog:             args.UserLog,
 			IOFiles:             ioFiles,
+			FUSEMounts:          fuseMounts,
 			DevIOFile:           devIOFile,
 			MountsFile:          specFile,
 			Cgroup:              containerCgroup,

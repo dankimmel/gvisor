@@ -268,6 +268,10 @@ type Args struct {
 	// UserLog is the filename to send user-visible logs to. It may be empty.
 	UserLog string
 
+	// FUSEMounts are the dialed backend sockets for runsc-provisioned host-FD
+	// FUSE mounts. The sandbox takes ownership of the files and donates them.
+	FUSEMounts []specutils.FUSEMountFD
+
 	// IOFiles is the list of image files and/or socket files that connect to
 	// a gofer endpoint for the mount points using Gofers. They must be in the
 	// same order as mounts appear in the spec.
@@ -973,6 +977,19 @@ func (s *Sandbox) createSandboxProcess(conf *config.Config, args *Args, startSyn
 		// the glibc rseq, because they unmap everything from a process
 		// address space.
 		cmd.Env = append(cmd.Env, "GLIBC_TUNABLES=glibc.pthread.rseq=0")
+	}
+
+	// Donate the dialed host-FD FUSE backend sockets and pass their mount
+	// destinations (parallel to the donated FDs). Inert when there are none.
+	if len(args.FUSEMounts) > 0 {
+		fuseFiles := make([]*os.File, 0, len(args.FUSEMounts))
+		fuseDests := make([]string, 0, len(args.FUSEMounts))
+		for _, m := range args.FUSEMounts {
+			fuseFiles = append(fuseFiles, m.File)
+			fuseDests = append(fuseDests, m.Destination)
+		}
+		donations.DonateAndClose("fuse-fds", fuseFiles...)
+		cmd.Args = append(cmd.Args, "--fuse-mount-dests="+strings.Join(fuseDests, ","))
 	}
 
 	// If there is a gofer, sends all socket ends to the sandbox.

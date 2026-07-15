@@ -98,6 +98,14 @@ type Boot struct {
 	// ioFDs is the list of FDs used to connect to FS gofers.
 	ioFDs sandboxsetup.IntFlags
 
+	// fuseFDs are the connected backend socket FDs for runsc-provisioned host-FD
+	// FUSE mounts, parallel to fuseMountDests.
+	fuseFDs sandboxsetup.IntFlags
+
+	// fuseMountDests is a comma-separated list of destinations for the
+	// runsc-provisioned host-FD FUSE mounts, parallel to fuseFDs.
+	fuseMountDests string
+
 	// devIoFD is the FD to connect to dev gofer.
 	devIoFD int
 
@@ -265,6 +273,8 @@ func (b *Boot) SetFlags(f *flag.FlagSet) {
 	f.IntVar(&b.controllerFD, "controller-fd", -1, "required FD of a stream socket for the control server that must be donated to this process")
 	f.IntVar(&b.deviceFD, "device-fd", -1, "FD for the platform device file")
 	f.Var(&b.ioFDs, "io-fds", "list of image FDs and/or socket FDs to connect gofer clients. They must follow this order: root first, then mounts as defined in the spec")
+	f.Var(&b.fuseFDs, "fuse-fds", "list of connected backend socket FDs for runsc-provisioned host-FD FUSE mounts, parallel to --fuse-mount-dests")
+	f.StringVar(&b.fuseMountDests, "fuse-mount-dests", "", "comma-separated destinations for runsc-provisioned host-FD FUSE mounts, parallel to --fuse-fds")
 	f.IntVar(&b.devIoFD, "dev-io-fd", -1, "FD to connect dev gofer client")
 	f.Var(&b.stdioFDs, "stdio-fds", "list of FDs containing sandbox stdin, stdout, and stderr in that order")
 	f.Var(&b.passFDs, "pass-fd", "mapping of host to guest FDs. They must be in M:N format. M is the host and N the guest descriptor.")
@@ -298,6 +308,15 @@ func (b *Boot) SetFlags(f *flag.FlagSet) {
 
 // Execute implements subcommands.Command.Execute.  It starts a sandbox in a
 // waiting state.
+// splitNonEmpty splits a comma-separated list, returning nil (not [""]) for an
+// empty string.
+func splitNonEmpty(s string) []string {
+	if s == "" {
+		return nil
+	}
+	return strings.Split(s, ",")
+}
+
 func (b *Boot) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcommands.ExitStatus {
 	if b.specFD == -1 || b.controllerFD == -1 || b.startSyncFD == -1 || f.NArg() != 1 {
 		f.Usage()
@@ -589,6 +608,8 @@ func (b *Boot) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomma
 		ControllerFD:        b.controllerFD,
 		Device:              fd.New(b.deviceFD),
 		GoferFDs:            b.ioFDs.GetArray(),
+		FUSEFDs:             b.fuseFDs.GetArray(),
+		FUSEMountDests:      splitNonEmpty(b.fuseMountDests),
 		DevGoferFD:          b.devIoFD,
 		StdioFDs:            b.stdioFDs.GetArray(),
 		PassFDs:             b.passFDs.GetArray(),

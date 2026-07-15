@@ -137,6 +137,11 @@ type containerInfo struct {
 	// goferFDs are the FDs that attach the sandbox to the gofers.
 	goferFDs []*fd.FD
 
+	// fuseFDs maps a host-FD FUSE mount's destination to the connected backend
+	// socket FD dialed and donated by the runsc CLI. Empty when the feature is
+	// unused.
+	fuseFDs map[string]*fd.FD
+
 	// devGoferFD is the FD to attach the sandbox to the dev gofer.
 	devGoferFD *fd.FD
 
@@ -382,6 +387,13 @@ type Args struct {
 	// GoferFDs is an array of FDs used to connect with the Gofer. The Loader
 	// takes ownership of these FDs and may close them at any time.
 	GoferFDs []int
+	// FUSEFDs are the connected backend socket FDs for runsc-provisioned host-FD
+	// FUSE mounts, in the same order as FUSEMountDests. The Loader takes
+	// ownership of these FDs.
+	FUSEFDs []int
+	// FUSEMountDests are the destinations of the runsc-provisioned host-FD FUSE
+	// mounts, parallel to FUSEFDs.
+	FUSEMountDests []string
 	// DevGoferFD is the FD for the dev gofer connection. The Loader takes
 	// ownership of this FD and may close it at any time.
 	DevGoferFD int
@@ -599,6 +611,15 @@ func New(args Args) (*Loader, error) {
 	}
 	for _, goferFD := range args.GoferFDs {
 		l.root.goferFDs = append(l.root.goferFDs, fd.New(goferFD))
+	}
+	if len(args.FUSEFDs) != len(args.FUSEMountDests) {
+		return nil, fmt.Errorf("FUSEFDs (%d) and FUSEMountDests (%d) length mismatch", len(args.FUSEFDs), len(args.FUSEMountDests))
+	}
+	if len(args.FUSEFDs) > 0 {
+		l.root.fuseFDs = make(map[string]*fd.FD, len(args.FUSEFDs))
+		for i, fuseFD := range args.FUSEFDs {
+			l.root.fuseFDs[args.FUSEMountDests[i]] = fd.New(fuseFD)
+		}
 	}
 	for _, filestoreFD := range args.GoferFilestoreFDs {
 		l.root.goferFilestoreFDs = append(l.root.goferFilestoreFDs, fd.New(filestoreFD))

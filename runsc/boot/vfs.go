@@ -415,6 +415,10 @@ type containerMounter struct {
 	// goferFDs is the list of FDs to be dispensed for gofer mounts.
 	goferFDs fdDispenser
 
+	// fuseFDs maps a host-FD FUSE mount's destination to its donated backend
+	// socket FD. Empty when the feature is unused.
+	fuseFDs map[string]*fd.FD
+
 	// goferFilestoreFDs are FDs to the regular files that will back the tmpfs or
 	// overlayfs mount for certain gofer mounts.
 	goferFilestoreFDs fdDispenser
@@ -455,6 +459,7 @@ func (l *Loader) newContainerMounter(info *containerInfo) *containerMounter {
 		root:              info.spec.Root,
 		mounts:            compileMounts(info.spec, info.conf, info.procArgs.ContainerID),
 		goferFDs:          fdDispenser{fds: info.goferFDs},
+		fuseFDs:           info.fuseFDs,
 		goferFilestoreFDs: fdDispenser{fds: info.goferFilestoreFDs},
 		devGoferFD:        info.devGoferFD,
 		goferMountConfs:   info.goferMountConfs,
@@ -879,6 +884,13 @@ func (c *containerMounter) prepareMounts() ([]mountInfo, error) {
 			hint:  c.l.mountHints.FindMount(c.mounts[i].Source),
 		}
 		specutils.MaybeConvertToBindMount(info.mount)
+		// A runsc-provisioned host-FD FUSE mount carries its donated backend
+		// socket FD in c.fuseFDs, keyed by destination.
+		if info.mount.Type == fuse.Name {
+			if f, ok := c.fuseFDs[info.mount.Destination]; ok {
+				info.goferFD = f
+			}
+		}
 		if specutils.HasMountConfig(*info.mount) {
 			info.goferMountConf = c.goferMountConfs[goferMntIdx]
 			if info.goferMountConf.ShouldUseLisafs() || info.goferMountConf.ShouldUseErofs() {
