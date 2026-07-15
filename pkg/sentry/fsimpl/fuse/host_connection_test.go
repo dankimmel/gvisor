@@ -538,31 +538,34 @@ func TestHostConnectionNoReplyInterleaved(t *testing.T) {
 	}
 }
 
-// TestHostConnectionRejectsCheckpoint verifies that a host-FD connection rejects
-// checkpoint (beforeSave panics), while a device-FD connection does not.
-func TestHostConnectionRejectsCheckpoint(t *testing.T) {
+// TestHostFSPrepareSaveRequiresUniqueID verifies that a host-FD mount without a
+// checkpoint identity (e.g. an in-container `mount -t fuse -o fd=N`, not
+// runsc-provisioned) fails PrepareSave, so its checkpoint fails cleanly rather
+// than becoming unrestorable. A device mount's PrepareSave is a no-op.
+func TestHostFSPrepareSaveRequiresUniqueID(t *testing.T) {
+	s := setup(t)
+	defer s.Destroy()
+
 	hc, _, cleanup := newTestHostConnection(t)
 	defer cleanup()
+	hc.conn.isHostConn = true
 
-	func() {
-		defer func() {
-			if r := recover(); r == nil {
-				t.Error("expected beforeSave to panic for a host-FD connection")
-			}
-		}()
-		hc.conn.beforeSave()
-	}()
-
-	fsopts := filesystemOptions{
-		maxActiveRequests: maxActiveRequestsDefault,
-		maxRead:           4096,
+	// Host connection, no uniqueID => PrepareSave must fail.
+	hostFS := &filesystem{conn: hc.conn}
+	if err := hostFS.PrepareSave(s.Ctx); err == nil {
+		t.Error("PrepareSave: expected error for a host mount without a checkpoint identity")
 	}
+
+	// Device connection => PrepareSave is a no-op.
+	fsopts := filesystemOptions{maxActiveRequests: maxActiveRequestsDefault, maxRead: 4096}
 	dconn, err := newFUSEConnectionOpts(&fsopts)
 	if err != nil {
 		t.Fatalf("newFUSEConnectionOpts: %v", err)
 	}
-	// A device-FD connection must not panic.
-	dconn.beforeSave()
+	devFS := &filesystem{conn: dconn}
+	if err := devFS.PrepareSave(s.Ctx); err != nil {
+		t.Errorf("PrepareSave for device mount: %v", err)
+	}
 }
 
 func TestHostConnectionNotConnected(t *testing.T) {

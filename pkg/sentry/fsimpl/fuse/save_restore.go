@@ -36,18 +36,6 @@ func (fRes *futureResponse) afterLoad(goContext.Context) {
 	fRes.ch = make(chan struct{})
 }
 
-// beforeSave is invoked by stateify. Host-FD checkpoint/restore is not yet
-// end-to-end: the Sentry-side replay restore (below) is implemented, but the
-// runsc-side restore re-dial + FD donation is not, so a saved host mount could
-// not be restored. Keep rejecting the checkpoint until the full path lands, so
-// checkpoints fail cleanly rather than becoming unrestorable. This panic is
-// removed in the commit that wires the restore FD donation.
-func (conn *connection) beforeSave() {
-	if _, ok := conn.fuseConn.(*hostConnection); ok {
-		panic("fuse: host-FD FUSE connection does not support checkpoint/restore")
-	}
-}
-
 func (conn *connection) afterLoad(goContext.Context) {
 	// For host-FD connections, the transport is reconstructed by the
 	// filesystem's CompleteRestore (fresh FD, re-INIT, replay walk); leave
