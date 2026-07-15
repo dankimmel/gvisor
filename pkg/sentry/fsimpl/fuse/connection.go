@@ -16,7 +16,9 @@ package fuse
 
 import (
 	goContext "context"
+	"fmt"
 	"sync"
+	"time"
 
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
@@ -452,6 +454,27 @@ func (conn *connection) callFuture(b context.Blocker, r *Request) (*futureRespon
 		return nil, err
 	}
 	return conn.callFutureLocked(r)
+}
+
+// drainForSave waits for all in-flight requests to complete, up to timeout. It
+// is used during checkpoint of a host-FD mount: the sandbox is paused (so no new
+// requests are issued) and the transport's reader is about to be torn down, so
+// any request still awaiting a reply must first be allowed to complete.
+// Returns an error if requests remain in flight at the deadline, which fails the
+// checkpoint rather than losing a reply.
+func (conn *connection) drainForSave(timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	conn.mu.Lock()
+	defer conn.mu.Unlock()
+	for conn.numActiveRequests > 0 {
+		if time.Now().After(deadline) {
+			return fmt.Errorf("fuse: %d request(s) still in flight after %v", conn.numActiveRequests, timeout)
+		}
+		conn.mu.Unlock()
+		time.Sleep(time.Millisecond)
+		conn.mu.Lock()
+	}
+	return nil
 }
 
 // waitForSlot blocks until an active-request slot is available, or the
