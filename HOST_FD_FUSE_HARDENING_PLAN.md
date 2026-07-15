@@ -7,6 +7,44 @@ you do NOT need to read any external design doc. Everything you need is here.
 
 ---
 
+## Implementation status (living)
+
+Verification note: this environment has no working Bazel (docker.io and
+releases.bazel.build are blocked by egress policy) and gVisor needs Bazel-generated
+code, so nothing below was run in-tree here — **CI is the authoritative gate.** The
+two trickiest pieces (the stream framer; the pool/gate/ownership accounting) were
+validated in standalone socketpair/`-race` harnesses before porting. Everything is
+gofmt-clean and hand-checked against the real APIs.
+
+- **Stage 1 — noReply leak:** DONE (RED+GREEN).
+- **Stage 2 — framer + notification discard + S/R rejection:** DONE.
+- **Stage 3 — Sentry options/clamps/coupling; maxFrame=reply_buf_max:** DONE.
+- **Stage 4 — runsc surface:** flags (4.1) DONE; annotations (4.2) DONE; provisioning
+  core — `ValidateFUSESocketSource` + `FUSEMountData` (part of 4.3/4.4) DONE with tests.
+  **DEFERRED:** the CLI-side UDS dial + FD-donation-across-exec and the boot
+  `case fuse.Name:` in `getMountNameAndOptions` that consumes the donated FD. This is
+  security-sensitive FD-passing glue crossing the sandbox boundary, unverifiable
+  without CI, and needs a security review. The in-container `mount -t fuse -o fd=N`
+  path already works without it.
+- **Stage 5 — buffer pools + Release + enforcement:** DONE (5.1 pool primitive,
+  5.2 reader wiring + Response.Release, 5.3 handler threading, 5.4 READ aliasing +
+  poison hook). The finalizer/poison detectors are compiled out unless the
+  `debugFUSEBuffers` constant is flipped (a manual bring-up step; no build-tag test
+  infra was added).
+- **Stage 6 — admission control + interruption ownership:** DONE (shared
+  `waitForSlot`, host gate, abort drain via `fullQueueCh` close, interruption
+  ownership rule, interruptible-context tests).
+- **Stage 7 — checkpoint/restore via replay:** NOT STARTED. Hard-depends on the
+  deferred Stage 4 CLI dial+donation (restore re-dials the UDS and donates a fresh FD
+  through the same path). Also the largest/subtlest stage — expand into RED/GREEN
+  commits and get sign-off before implementing. Until it lands, Stage 2.4's loud
+  checkpoint rejection stays.
+
+Landable-blind work is exhausted at this boundary: the remaining pieces are gated on
+the unverifiable, security-sensitive CLI FD-donation mechanism.
+
+---
+
 ## 0. Orientation — what exists today and what we are changing
 
 gVisor's Sentry has a FUSE client (`pkg/sentry/fsimpl/fuse/`). A fusefs mount normally
