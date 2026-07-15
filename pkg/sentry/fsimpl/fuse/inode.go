@@ -602,6 +602,8 @@ func (i *inode) Open(ctx context.Context, rp *vfs.ResolvingPath, d *kernfs.Dentr
 	if err := fd.vfsfd.Init(fdImpl, opts.Flags, rp.Credentials(), rp.Mount(), d.VFSDentry(), fdOptions); err != nil {
 		return nil, err
 	}
+	// Track the FD so its server file handle can be re-opened on restore.
+	i.fs.registerFD(fd)
 	return &fd.vfsfd, nil
 }
 

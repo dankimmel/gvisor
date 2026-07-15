@@ -30,6 +30,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/ktime"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
+	"gvisor.dev/gvisor/pkg/sync"
 )
 
 // Name is the default filesystem name.
@@ -158,6 +159,19 @@ type filesystem struct {
 	// fresh backend FD in the restore FD map. Empty for the device path and for
 	// host mounts not provisioned by runsc (which cannot be restored).
 	uniqueID checkpoint.ResourceID
+
+	// root is the filesystem's root dentry, retained so the restore replay walk
+	// can traverse the inode tree.
+	root *kernfs.Dentry
+
+	// openMu protects openFDs.
+	openMu sync.Mutex `state:"nosave"`
+
+	// openFDs tracks live file descriptions so their server file handles can be
+	// re-opened on restore.
+	//
+	// +checklocks:openMu
+	openFDs map[*fileDescription]struct{}
 }
 
 // Name implements vfs.FilesystemType.Name.
@@ -167,6 +181,20 @@ func (FilesystemType) Name() string {
 
 // Release implements vfs.FilesystemType.Release.
 func (FilesystemType) Release(ctx context.Context) {}
+
+// registerFD records fd so its server file handle can be re-opened on restore.
+func (fs *filesystem) registerFD(fd *fileDescription) {
+	fs.openMu.Lock()
+	defer fs.openMu.Unlock()
+	fs.openFDs[fd] = struct{}{}
+}
+
+// unregisterFD stops tracking fd.
+func (fs *filesystem) unregisterFD(fd *fileDescription) {
+	fs.openMu.Lock()
+	defer fs.openMu.Unlock()
+	delete(fs.openFDs, fd)
+}
 
 // GetFilesystem implements vfs.FilesystemType.GetFilesystem.
 func (fsType FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.VirtualFilesystem, creds *auth.Credentials, source string, opts vfs.GetFilesystemOptions) (*vfs.Filesystem, *vfs.Dentry, error) {
@@ -261,6 +289,7 @@ func (fsType FilesystemType) getFilesystemDeviceFD(ctx context.Context, vfsObj *
 	}
 
 	root := fs.newRoot(ctx, creds, fsopts.rootMode)
+	fs.root = root
 	return fs.VFSFilesystem(), root.VFSDentry(), nil
 }
 
@@ -306,6 +335,7 @@ func (fsType FilesystemType) getFilesystemHostFD(ctx context.Context, vfsObj *vf
 		conn:     conn,
 		clock:    ktime.RealtimeClockFromContext(ctx),
 		uniqueID: uniqueID,
+		openFDs:  make(map[*fileDescription]struct{}),
 	}
 	fs.VFSFilesystem().Init(vfsObj, &fsType, fs)
 
@@ -322,6 +352,7 @@ func (fsType FilesystemType) getFilesystemHostFD(ctx context.Context, vfsObj *vf
 	}
 
 	root := fs.newRoot(ctx, creds, fsopts.rootMode)
+	fs.root = root
 	return fs.VFSFilesystem(), root.VFSDentry(), nil
 }
 
@@ -534,6 +565,7 @@ func newFUSEFilesystem(ctx context.Context, vfsObj *vfs.VirtualFilesystem, fsTyp
 		opts:     opts,
 		conn:     fuseFD.conn,
 		clock:    ktime.RealtimeClockFromContext(ctx),
+		openFDs:  make(map[*fileDescription]struct{}),
 	}
 	fs.VFSFilesystem().Init(vfsObj, fsType, fs)
 	return fs, nil

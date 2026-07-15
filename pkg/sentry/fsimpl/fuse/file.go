@@ -68,8 +68,9 @@ func (fd *fileDescription) statusFlags() uint32 {
 
 // Release implements vfs.FileDescriptionImpl.Release.
 func (fd *fileDescription) Release(ctx context.Context) {
-	// no need to release if FUSE server doesn't implement Open.
 	fs := fd.inode().fs
+	fs.unregisterFD(fd)
+	// no need to release if FUSE server doesn't implement Open.
 	if fs.conn.noOpen {
 		return
 	}
