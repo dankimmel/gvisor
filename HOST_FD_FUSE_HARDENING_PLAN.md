@@ -42,11 +42,50 @@ gofmt-clean and hand-checked against the real APIs.
 - **Stage 6 — admission control + interruption ownership:** DONE (shared
   `waitForSlot`, host gate, abort drain via `fullQueueCh` close, interruption
   ownership rule, interruptible-context tests).
-- **Stage 7 — checkpoint/restore via replay:** NOT STARTED. Hard-depends on the
-  deferred Stage 4 CLI dial+donation (restore re-dials the UDS and donates a fresh FD
-  through the same path). Also the largest/subtlest stage — expand into RED/GREEN
-  commits and get sign-off before implementing. Until it lands, Stage 2.4's loud
-  checkpoint rejection stays.
+- **Stage 7 — checkpoint/restore via replay:** GROUNDWORK LANDED (`drainForSave` +
+  test). The replay restore itself is specified below but intentionally NOT written
+  blind: it manipulates stateify + the VFS restore machinery, a bug corrupts restored
+  filesystems *silently*, it can't be harness-validated, and it is all-or-nothing (a
+  partial implementation that lifts the Stage 2.4 rejection yields save-but-corrupt-
+  restore, strictly worse than today). Do it with working CI + a checkpoint/restore
+  review. Concrete executable breakdown (RED/GREEN each; lift the rejection only in the
+  final commit):
+
+  1. **Mount identity + FD map key.** In `getMountNameAndOptions`'s fuse case set
+     `internalData = fuse.InternalFilesystemOptions{UniqueID: checkpoint.ResourceID{
+     ContainerName, Path: dest}}` (mirror erofs). Add that struct to the fuse package;
+     `GetFilesystem` reads it from `opts.InternalData` and stores the `UniqueID` on the
+     `filesystem`. Tests: emission includes it; GetFilesystem stores it.
+  2. **Savable-state audit.** Confirm `hostConnection` (hostFD, reader goroutine,
+     `readBuf`, `pool`) is fully `nosave` (the whole `fuseConn` is already
+     `state:"nosave"`); ensure the negotiated INIT params + mount options on `connection`
+     are saved (they are plain fields — verify no `nosave`). Save the per-inode `nodeID`
+     and open-handle `Fh` so the walk can rewrite them.
+  3. **`FilesystemImplSaveRestoreExtension` on fusefs.** `PrepareSave`: `drainForSave`
+     (already implemented) then purge non-reopenable cached dentries. `CompleteRestore`:
+     pull the fresh FD from `vfs.RestoreFilesystemFDMapFromContext(ctx)[fs.uniqueID]`,
+     rebuild the `hostConnection` (`newHostConnection` + `InitSend` re-negotiates; **fail
+     restore if the new negotiation is incompatible** with saved assumptions, e.g.
+     `maxWrite` shrank), then run the replay walk.
+  4. **Replay walk** (mirror gofer `restoreDescendantsRecursive`): from the root, for
+     each live dentry re-issue `FUSE_LOOKUP` by name to obtain a fresh `nodeID` and
+     rewrite it; for each open handle re-issue `FUSE_OPEN`/`OPENDIR` to obtain a fresh
+     `Fh` and rewrite it. Reset FORGET lookup-count bookkeeping (old counts belong to the
+     dead session). Files unlinked-but-open cannot be re-looked-up by path → fail restore
+     on them (documented limitation).
+  5. **Replace the Stage 2.4 rejection.** Delete `connection.beforeSave`'s host panic;
+     `afterLoad` must reconstruct host state lazily (or leave it to `CompleteRestore`)
+     instead of forcing a `deviceConn`.
+  6. **runsc restore FD-donation.** On restore, re-dial the UDS
+     (`specutils.DialFUSEMounts`) and donate the fresh FD via `configureRestore`'s fdmap,
+     keyed by the same `UniqueID`. Guard/allow a socket-path override in the restore spec.
+  7. **e2e.** Extend `test/fuse_host/`: checkpoint a running host-FUSE mount, restore
+     against a re-launched backend, assert data intact + open FDs usable; failure cases
+     (backend absent at restore, incompatible re-INIT, unlinked-open file).
+
+  Accepted limitations to document in g3doc: restore re-binds by *path* (same-path
+  replacement silently rebinds; unlinked-open files fail restore); nodeids/Fh are
+  session-scoped and re-learned; restore cost scales with live dentries/handles.
 
 Landable-blind work is exhausted at this boundary: the remaining pieces are gated on
 the unverifiable, security-sensitive CLI FD-donation mechanism.
