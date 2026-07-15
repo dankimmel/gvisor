@@ -122,3 +122,64 @@ func TestFUSEMountData(t *testing.T) {
 		}
 	}
 }
+
+func TestDialFUSEMounts(t *testing.T) {
+	dir := t.TempDir()
+	sockPath := filepath.Join(dir, "backend.sock")
+	ln, err := net.Listen("unix", sockPath)
+	if err != nil {
+		t.Fatalf("net.Listen: %v", err)
+	}
+	defer ln.Close()
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			c.Close()
+		}
+	}()
+
+	spec := &specs.Spec{Mounts: []specs.Mount{
+		{Type: "bind", Source: "/somewhere", Destination: "/data"},
+		{Type: FUSEMountType, Source: sockPath, Destination: "/mnt/fuse"},
+	}}
+
+	// Success: one fuse mount is dialed.
+	got, err := DialFUSEMounts(spec, dir, time.Second)
+	if err != nil {
+		t.Fatalf("DialFUSEMounts: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("got %d dialed mounts, want 1", len(got))
+	}
+	if got[0].Destination != "/mnt/fuse" {
+		t.Errorf("destination = %q, want /mnt/fuse", got[0].Destination)
+	}
+	got[0].File.Close()
+
+	// Feature disabled (empty allowlist) with a fuse mount present is an error.
+	if _, err := DialFUSEMounts(spec, "", time.Second); err == nil {
+		t.Error("DialFUSEMounts with empty allowlist and a fuse mount: got nil error")
+	}
+
+	// Source outside the allowlist is an error.
+	if _, err := DialFUSEMounts(spec, "/some/other/dir", time.Second); err == nil {
+		t.Error("DialFUSEMounts with source outside allowlist: got nil error")
+	}
+
+	// No listener at the socket path is an error.
+	badSpec := &specs.Spec{Mounts: []specs.Mount{
+		{Type: FUSEMountType, Source: filepath.Join(dir, "absent.sock"), Destination: "/mnt/fuse"},
+	}}
+	if _, err := DialFUSEMounts(badSpec, dir, 200*time.Millisecond); err == nil {
+		t.Error("DialFUSEMounts with no listener: got nil error")
+	}
+
+	// No fuse mounts, feature disabled: not an error.
+	noFuse := &specs.Spec{Mounts: []specs.Mount{{Type: "bind", Source: "/x", Destination: "/y"}}}
+	if got, err := DialFUSEMounts(noFuse, "", time.Second); err != nil || len(got) != 0 {
+		t.Errorf("DialFUSEMounts with no fuse mounts: got %v, %v; want nil, nil", got, err)
+	}
+}

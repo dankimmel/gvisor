@@ -16,12 +16,20 @@ package specutils
 
 import (
 	"fmt"
+	"net"
+	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
+	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"gvisor.dev/gvisor/pkg/log"
 )
+
+// FUSEMountType is the OCI mount type identifying a runsc-provisioned host-FD
+// FUSE mount. It matches the Sentry's fuse.Name.
+const FUSEMountType = "fuse"
 
 // Annotations that override the default host-FD FUSE memory limits for a
 // container. Each may be suffixed with ".<container-name>" to target a single
@@ -111,6 +119,58 @@ func ValidateFUSESocketSource(source, allowedDirs string) error {
 		return nil
 	}
 	return fmt.Errorf("fuse backend socket path %q is not inside any --fuse-allowed-socket-dirs entry", source)
+}
+
+// FUSEMountFD pairs a fuse mount destination with the connected backend socket.
+// The caller owns and must close File (typically by donating it to the sandbox).
+type FUSEMountFD struct {
+	Destination string
+	File        *os.File
+}
+
+// DialFUSEMounts finds fuse-type mounts in spec, validates each backend socket
+// path against allowedDirs, dials it (with the given per-connection timeout),
+// and returns the connected files in spec-mount order. On any error every
+// already-dialed file is closed. An empty allowedDirs with no fuse mounts is not
+// an error; a fuse mount present with the feature disabled is.
+func DialFUSEMounts(spec *specs.Spec, allowedDirs string, timeout time.Duration) ([]FUSEMountFD, error) {
+	var out []FUSEMountFD
+	closeAll := func() {
+		for _, m := range out {
+			m.File.Close()
+		}
+	}
+	for i := range spec.Mounts {
+		m := &spec.Mounts[i]
+		if m.Type != FUSEMountType {
+			continue
+		}
+		if err := ValidateFUSESocketSource(m.Source, allowedDirs); err != nil {
+			closeAll()
+			return nil, err
+		}
+		conn, err := net.DialTimeout("unix", m.Source, timeout)
+		if err != nil {
+			closeAll()
+			return nil, fmt.Errorf("dialing fuse backend %q for mount %q: %w", m.Source, m.Destination, err)
+		}
+		uconn, ok := conn.(*net.UnixConn)
+		if !ok {
+			conn.Close()
+			closeAll()
+			return nil, fmt.Errorf("fuse backend %q is not a unix socket", m.Source)
+		}
+		// File() returns a dup of the socket FD as an *os.File; close the
+		// net.Conn, keeping the dup.
+		f, err := uconn.File()
+		uconn.Close()
+		if err != nil {
+			closeAll()
+			return nil, fmt.Errorf("obtaining fd for fuse backend %q: %w", m.Source, err)
+		}
+		out = append(out, FUSEMountFD{Destination: m.Destination, File: f})
+	}
+	return out, nil
 }
 
 // FUSEMountData builds the fusefs mount-option string for a runsc-provisioned
