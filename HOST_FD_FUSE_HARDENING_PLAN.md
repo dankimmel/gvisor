@@ -28,13 +28,12 @@ gofmt-clean and hand-checked against the real APIs.
     backend UDS, returns owned socket files; tested against a real listener). DONE.
   - Boot `case fuse.Name:` in `getMountNameAndOptions` (emits `host_fd=` + tuning
     options, marks the mount internal). DONE.
-  - **REMAINING (not written):** the FD-donation plumbing carrying `DialFUSEMounts`'s
-    files through the sandbox `cmd` FD donation → boot-arg serialization/flags → the
-    containerMounter FD dispenser → `prepareMounts` assigning the FD to the fuse
-    `mountInfo`. ~5 files on the sandbox-creation critical path; a boot-arg or FD-index
-    mistake breaks all sandbox creation, and the boot-arg round-trip is unverifiable
-    here. This is the one seam left; it should be written and exercised with working CI.
-    The in-container `mount -t fuse -o fd=N` path already works without any of this.
+  - FD-donation plumbing (container.go dial → sandbox.go donate `--fuse-fds` +
+    `--fuse-mount-dests` → boot.go parse → loader dest→FD map → `prepareMounts`
+    assignment). DONE for the **root container**, additive and guarded (inert with no
+    fuse mounts / empty allowlist). **Subcontainer** support (routing the FDs through
+    the controller RPC to `startSubcontainer`) is a follow-up. Unverifiable here — CI
+    must exercise the boot-arg round-trip.
 - **Stage 5 — buffer pools + Release + enforcement:** DONE (5.1 pool primitive,
   5.2 reader wiring + Response.Release, 5.3 handler threading, 5.4 READ aliasing +
   poison hook). The finalizer/poison detectors are compiled out unless the
