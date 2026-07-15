@@ -106,6 +106,11 @@ type filesystemOptions struct {
 	// buffers for a host-FD mount, specified as "reply_buf_concurrency".
 	replyBufConcurrency uint32
 
+	// bootHostFD is a raw host FD in the Sentry process backing a
+	// runsc-provisioned host-FD mount, specified as "host_fd". It is honored only
+	// for internal mounts (not container-issued mount() calls). -1 when absent.
+	bootHostFD int
+
 	// defaultPermissions is the default_permissions mount option. It instructs
 	// the kernel to perform a standard unix permission checks based on
 	// ownership and mode bits, instead of deferring the check to the server.
@@ -160,6 +165,21 @@ func (fsType FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 	}
 
 	kernelTask := kernel.TaskFromContext(ctx)
+
+	// A runsc-provisioned mount carries a raw Sentry-process host FD in host_fd
+	// rather than a task FD. This is only honored for internal mounts, so a
+	// container cannot use it to reach an arbitrary Sentry-process FD.
+	if fsopts.bootHostFD >= 0 {
+		if !opts.InternalMount {
+			log.Warningf("%s.GetFilesystem: host_fd is only permitted for internal mounts", fsType.Name())
+			return nil, nil, linuxerr.EINVAL
+		}
+		// getFilesystemHostFD dups the FD; we own the donated original, so close
+		// it once the connection has its own copy.
+		defer unix.Close(fsopts.bootHostFD)
+		return fsType.getFilesystemHostFD(ctx, vfsObj, creds, kernelTask, int32(fsopts.bootHostFD), devMinor, fsopts)
+	}
+
 	if kernelTask == nil {
 		log.Warningf("%s.GetFilesystem: couldn't get kernel task from context", fsType.Name())
 		return nil, nil, linuxerr.EINVAL
@@ -267,7 +287,12 @@ func (fsType FilesystemType) getFilesystemHostFD(ctx context.Context, vfsObj *vf
 
 	rootUserNs := kernel.KernelFromContext(ctx).RootUserNamespace()
 	hasSysAdmin := creds.HasCapabilityIn(linux.CAP_SYS_ADMIN, rootUserNs)
-	if err := hostConn.InitSend(creds, uint32(kernelTask.ThreadID()), hasSysAdmin); err != nil {
+	// Internal (runsc-provisioned) mounts have no initiating task; use pid 0.
+	var pid uint32
+	if kernelTask != nil {
+		pid = uint32(kernelTask.ThreadID())
+	}
+	if err := hostConn.InitSend(creds, pid, hasSysAdmin); err != nil {
 		log.Warningf("%s.getFilesystemHostFD: InitSend failed: %v", fsType.Name(), err)
 		return nil, nil, err
 	}
@@ -281,21 +306,36 @@ func parseOptions(ctx context.Context, creds *auth.Credentials, data string) (*f
 		mopts:             data,
 		maxActiveRequests: maxActiveRequestsDefault,
 		maxRead:           math.MaxUint32,
+		bootHostFD:        -1,
 	}
 
 	mopts := vfs.GenericParseMountOptions(data)
 
-	// Parse 'fd'.
-	deviceDescriptorStr, ok := mopts["fd"]
-	if !ok {
-		ctx.Warningf("fusefs.FilesystemType.GetFilesystem: mandatory mount option fd missing")
-		return nil, 0, linuxerr.EINVAL
+	// Parse 'host_fd': a raw Sentry-process FD for a runsc-provisioned mount.
+	// When present it makes 'fd' optional; it is only honored for internal mounts
+	// (enforced by the caller).
+	if hostFDStr, ok := mopts["host_fd"]; ok {
+		delete(mopts, "host_fd")
+		hostFD, err := strconv.ParseInt(hostFDStr, 10, 32)
+		if err != nil || hostFD < 0 {
+			ctx.Warningf("fusefs.parseOptions: invalid host_fd: %q", hostFDStr)
+			return nil, 0, linuxerr.EINVAL
+		}
+		fsopts.bootHostFD = int(hostFD)
 	}
-	delete(mopts, "fd")
 
-	deviceDescriptor, err := strconv.ParseInt(deviceDescriptorStr, 10, 32)
-	if err != nil {
-		ctx.Debugf("fusefs.FilesystemType.GetFilesystem: invalid fd: %q (%v)", deviceDescriptorStr, err)
+	// Parse 'fd' (a task FD). Mandatory unless host_fd was given.
+	deviceDescriptor := int64(-1)
+	if deviceDescriptorStr, ok := mopts["fd"]; ok {
+		delete(mopts, "fd")
+		var err error
+		deviceDescriptor, err = strconv.ParseInt(deviceDescriptorStr, 10, 32)
+		if err != nil {
+			ctx.Debugf("fusefs.FilesystemType.GetFilesystem: invalid fd: %q (%v)", deviceDescriptorStr, err)
+			return nil, 0, linuxerr.EINVAL
+		}
+	} else if fsopts.bootHostFD < 0 {
+		ctx.Warningf("fusefs.FilesystemType.GetFilesystem: mandatory mount option fd (or host_fd) missing")
 		return nil, 0, linuxerr.EINVAL
 	}
 

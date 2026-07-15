@@ -85,6 +85,48 @@ func TestParseOptionsHostFDMemoryOptions(t *testing.T) {
 	}
 }
 
+func TestParseOptionsHostFD(t *testing.T) {
+	s := setup(t)
+	defer s.Destroy()
+	creds := auth.CredentialsFromContext(s.Ctx)
+
+	base := "user_id=0,group_id=0,rootmode=40000"
+
+	// host_fd is parsed into bootHostFD and makes fd optional.
+	fsopts, fd, err := parseOptions(s.Ctx, creds, base+",host_fd=7")
+	if err != nil {
+		t.Fatalf("parseOptions with host_fd: %v", err)
+	}
+	if fsopts.bootHostFD != 7 {
+		t.Errorf("bootHostFD = %d, want 7", fsopts.bootHostFD)
+	}
+	if fd != -1 {
+		t.Errorf("deviceDescriptor = %d, want -1 when only host_fd is given", fd)
+	}
+
+	// A task fd leaves bootHostFD == -1.
+	fsopts, fd, err = parseOptions(s.Ctx, creds, base+",fd=3")
+	if err != nil {
+		t.Fatalf("parseOptions with fd: %v", err)
+	}
+	if fsopts.bootHostFD != -1 {
+		t.Errorf("bootHostFD = %d, want -1 when only fd is given", fsopts.bootHostFD)
+	}
+	if fd != 3 {
+		t.Errorf("deviceDescriptor = %d, want 3", fd)
+	}
+
+	// Neither fd nor host_fd is an error.
+	if _, _, err := parseOptions(s.Ctx, creds, base); err == nil {
+		t.Errorf("parseOptions without fd or host_fd: got nil error, want EINVAL")
+	}
+
+	// Non-numeric host_fd is an error.
+	if _, _, err := parseOptions(s.Ctx, creds, base+",host_fd=abc"); err == nil {
+		t.Errorf("parseOptions with invalid host_fd: got nil error, want EINVAL")
+	}
+}
+
 func TestParseOptionsInvalidMemoryOptions(t *testing.T) {
 	s := setup(t)
 	defer s.Destroy()
