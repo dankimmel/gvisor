@@ -19,13 +19,22 @@ gofmt-clean and hand-checked against the real APIs.
 - **Stage 1 — noReply leak:** DONE (RED+GREEN).
 - **Stage 2 — framer + notification discard + S/R rejection:** DONE.
 - **Stage 3 — Sentry options/clamps/coupling; maxFrame=reply_buf_max:** DONE.
-- **Stage 4 — runsc surface:** flags (4.1) DONE; annotations (4.2) DONE; provisioning
-  core — `ValidateFUSESocketSource` + `FUSEMountData` (part of 4.3/4.4) DONE with tests.
-  **DEFERRED:** the CLI-side UDS dial + FD-donation-across-exec and the boot
-  `case fuse.Name:` in `getMountNameAndOptions` that consumes the donated FD. This is
-  security-sensitive FD-passing glue crossing the sandbox boundary, unverifiable
-  without CI, and needs a security review. The in-container `mount -t fuse -o fd=N`
-  path already works without it.
+- **Stage 4 — runsc surface:** flags (4.1) DONE; annotations (4.2) DONE. Provisioning,
+  all with tests:
+  - Sentry boot-time raw-FD mount path (`host_fd=`, internal-mount-only, dups + closes
+    the donated original; `getFilesystemHostFD` tolerates a nil task). DONE.
+  - `specutils`: `ValidateFUSESocketSource` (allowlist gate), `FUSEMountData` (mount
+    string), `FUSEMemoryLimitsFromAnnotations`, `DialFUSEMounts` (validates + dials the
+    backend UDS, returns owned socket files; tested against a real listener). DONE.
+  - Boot `case fuse.Name:` in `getMountNameAndOptions` (emits `host_fd=` + tuning
+    options, marks the mount internal). DONE.
+  - **REMAINING (not written):** the FD-donation plumbing carrying `DialFUSEMounts`'s
+    files through the sandbox `cmd` FD donation → boot-arg serialization/flags → the
+    containerMounter FD dispenser → `prepareMounts` assigning the FD to the fuse
+    `mountInfo`. ~5 files on the sandbox-creation critical path; a boot-arg or FD-index
+    mistake breaks all sandbox creation, and the boot-arg round-trip is unverifiable
+    here. This is the one seam left; it should be written and exercised with working CI.
+    The in-container `mount -t fuse -o fd=N` path already works without any of this.
 - **Stage 5 — buffer pools + Release + enforcement:** DONE (5.1 pool primitive,
   5.2 reader wiring + Response.Release, 5.3 handler threading, 5.4 READ aliasing +
   poison hook). The finalizer/poison detectors are compiled out unless the
