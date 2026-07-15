@@ -15,7 +15,10 @@
 package specutils
 
 import (
+	"fmt"
+	"path/filepath"
 	"strconv"
+	"strings"
 
 	"gvisor.dev/gvisor/pkg/log"
 )
@@ -75,4 +78,46 @@ func FUSEMemoryLimitsFromAnnotations(annotations map[string]string, containerNam
 	override(AnnotationFUSEReplyBufMax, &out.ReplyBufMax)
 	override(AnnotationFUSEReplyBufConcurrency, &out.ReplyBufConcurrency)
 	return out
+}
+
+// ValidateFUSESocketSource checks that a runsc-provisioned host-FD FUSE mount's
+// backend Unix-domain-socket path is permitted: it must be a clean absolute
+// path strictly inside one of the comma-separated directories in allowedDirs.
+// An empty allowedDirs disables the feature. This is the runsc-side gate on an
+// otherwise untrusted (e.g. pod-annotation-supplied) socket path; the Sentry
+// never dials the host, so this is the only place the path is vetted.
+func ValidateFUSESocketSource(source, allowedDirs string) error {
+	if strings.TrimSpace(allowedDirs) == "" {
+		return fmt.Errorf("host-FD FUSE mounts are disabled: --fuse-allowed-socket-dirs is empty")
+	}
+	if !filepath.IsAbs(source) {
+		return fmt.Errorf("fuse backend socket path %q must be absolute", source)
+	}
+	clean := filepath.Clean(source)
+	for _, dir := range strings.Split(allowedDirs, ",") {
+		dir = strings.TrimSpace(dir)
+		if dir == "" || !filepath.IsAbs(dir) {
+			continue
+		}
+		rel, err := filepath.Rel(filepath.Clean(dir), clean)
+		if err != nil {
+			continue
+		}
+		// Accept only paths strictly inside dir (not dir itself, and not
+		// escaping it via "..").
+		if rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+			continue
+		}
+		return nil
+	}
+	return fmt.Errorf("fuse backend socket path %q is not inside any --fuse-allowed-socket-dirs entry", source)
+}
+
+// FUSEMountData builds the fusefs mount-option string for a runsc-provisioned
+// host-FD FUSE mount: the connection fd, the synthesized mandatory options
+// (user_id/group_id/rootmode), and the memory-limit tuning options. The Sentry
+// re-parses and clamps every value; these are conveniences, not enforcement.
+func FUSEMountData(fd int, uid, gid uint32, rootMode uint32, limits FUSEMemoryLimits) string {
+	return fmt.Sprintf("fd=%d,user_id=%d,group_id=%d,rootmode=%o,max_inflight=%d,reply_buf_max=%d,reply_buf_concurrency=%d",
+		fd, uid, gid, rootMode, limits.MaxInflight, limits.ReplyBufMax, limits.ReplyBufConcurrency)
 }

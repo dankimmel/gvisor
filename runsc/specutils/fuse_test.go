@@ -14,7 +14,10 @@
 
 package specutils
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestFUSEMemoryLimitsFromAnnotations(t *testing.T) {
 	def := FUSEMemoryLimits{MaxInflight: 10000, ReplyBufMax: 1 << 20, ReplyBufConcurrency: 16}
@@ -72,5 +75,50 @@ func TestFUSEMemoryLimitsFromAnnotations(t *testing.T) {
 				t.Errorf("FUSEMemoryLimitsFromAnnotations() = %+v, want %+v", got, tc.want)
 			}
 		})
+	}
+}
+
+func TestValidateFUSESocketSource(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		source      string
+		allowedDirs string
+		wantErr     bool
+	}{
+		{"disabled-empty-allowlist", "/run/fuse/backend.sock", "", true},
+		{"allowed", "/run/fuse/backend.sock", "/run/fuse", false},
+		{"allowed-among-multiple", "/var/run/x/b.sock", "/run/fuse,/var/run/x", false},
+		{"allowed-nested", "/run/fuse/sub/dir/b.sock", "/run/fuse", false},
+		{"not-in-allowlist", "/tmp/b.sock", "/run/fuse", true},
+		{"relative-source", "run/fuse/b.sock", "/run/fuse", true},
+		{"escape-via-dotdot", "/run/fuse/../etc/b.sock", "/run/fuse", true},
+		{"is-the-dir-itself", "/run/fuse", "/run/fuse", true},
+		{"prefix-not-boundary", "/run/fuse-evil/b.sock", "/run/fuse", true},
+		{"relative-allowlist-entry-ignored", "/run/fuse/b.sock", "run/fuse", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := ValidateFUSESocketSource(tc.source, tc.allowedDirs)
+			if (err != nil) != tc.wantErr {
+				t.Errorf("ValidateFUSESocketSource(%q, %q) error = %v, wantErr = %v", tc.source, tc.allowedDirs, err, tc.wantErr)
+			}
+		})
+	}
+}
+
+func TestFUSEMountData(t *testing.T) {
+	limits := FUSEMemoryLimits{MaxInflight: 500, ReplyBufMax: 262144, ReplyBufConcurrency: 8}
+	got := FUSEMountData(7, 0, 0, 040000, limits)
+	for _, want := range []string{
+		"fd=7",
+		"user_id=0",
+		"group_id=0",
+		"rootmode=40000", // octal
+		"max_inflight=500",
+		"reply_buf_max=262144",
+		"reply_buf_concurrency=8",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("FUSEMountData() = %q, missing %q", got, want)
+		}
 	}
 }
