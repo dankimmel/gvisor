@@ -59,9 +59,25 @@ gofmt-clean and hand-checked against the real APIs.
   in-container host mounts (no `UniqueID`) still fail `PrepareSave` cleanly.
 
   NOT done: subcontainer restore (needs the controller-RPC FD routing, same follow-up as
-  create-time subcontainer support); an e2e checkpoint/restore test in `test/fuse_host/`
-  (needs a running sandbox — write it with CI). The original executable breakdown is
-  kept below for reference.
+  create-time subcontainer support). The original executable breakdown is kept below for
+  reference.
+
+  **Stage 8 (tests) — DONE.** End-to-end tests were added (unrunnable here; CI is the gate):
+  - `test/fuse_host/server.go` gained `ServeUDS`, a stream-framed FUSE server that
+    listens on a Unix socket and serves each accepted connection as a fresh session
+    (matching how runsc restore re-dials the backend). Runsc-provisioned mounts dial a
+    `SOCK_STREAM` socket, so it deframes by `FUSEHeaderIn.Len`.
+  - `test/fuse_host/workload/workload.go` gained a `--verify-dir` mode (verify a mount
+    runsc provisioned, no in-container `mount()`) with a `--loop` heartbeat that holds a
+    handle open across checkpoint/restore.
+  - `test/fuse_host/fuse_host_provisioned_test.go`: `TestFuseHostProvisionedUDS` (happy
+    path — dial + validate + donate + mount), `TestFuseHostSocketNotInAllowlist` and
+    `TestFuseHostProvisionedFeatureDisabled` (the runsc-side allowlist gate rejects
+    fast at container creation).
+  - `runsc/container/fuse_host_test.go`: `TestFuseHostProvisionedCheckpointRestore`
+    drives the proven container-API checkpoint/restore flow; the host-visible backing
+    file's growth resuming after restore proves the Sentry re-established the held-open
+    write handle (Stage 7 replay) against a freshly re-dialed session.
 
   1. **Mount identity + FD map key.** In `getMountNameAndOptions`'s fuse case set
      `internalData = fuse.InternalFilesystemOptions{UniqueID: checkpoint.ResourceID{

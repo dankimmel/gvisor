@@ -8,6 +8,7 @@ package(
 go_library(
     name = "fusehost",
     srcs = ["server.go"],
+    visibility = ["//visibility:public"],
     deps = [
         "//pkg/abi/linux",
         "@org_golang_x_sys//unix:go_default_library",
@@ -16,7 +17,10 @@ go_library(
 
 go_test(
     name = "fusehost_test",
-    srcs = ["fuse_host_test.go"],
+    srcs = [
+        "fuse_host_provisioned_test.go",
+        "fuse_host_test.go",
+    ],
     data = [
         "//runsc",
         "//test/fuse_host/workload",

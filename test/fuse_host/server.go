@@ -18,6 +18,7 @@
 package fusehost
 
 import (
+	"net"
 	"os"
 	"path/filepath"
 
@@ -27,7 +28,8 @@ import (
 
 // Serve runs a FUSE protocol server on fd, backed by the host directory
 // backDir. It handles requests until the connection is closed or an error
-// occurs. Intended to be called as a goroutine.
+// occurs. fd must be one end of a SOCK_SEQPACKET socketpair (the --pass-fd
+// transport). Intended to be called as a goroutine.
 func Serve(fd int, backDir string) {
 	s := &server{
 		fd:        fd,
@@ -36,6 +38,46 @@ func Serve(fd int, backDir string) {
 		openFiles: make(map[uint64]*os.File),
 	}
 	s.serve()
+}
+
+// ServeUDS accepts connections on ln and serves each as an independent FUSE
+// session backed by backDir, until ln is closed. Each accepted connection is a
+// fresh session (a new FUSE_INIT handshake), which is exactly what a runsc
+// restore relies on: after a checkpoint tears down the transport, runsc
+// re-dials the same socket and the Sentry replays its state against the new
+// session. Runsc-provisioned mounts dial a SOCK_STREAM Unix socket, so each
+// connection is deframed using the FUSE header length. Intended to be run as a
+// goroutine.
+func ServeUDS(ln *net.UnixListener, backDir string) {
+	for {
+		conn, err := ln.Accept()
+		if err != nil {
+			// Listener closed or errored; stop accepting.
+			return
+		}
+		uc, ok := conn.(*net.UnixConn)
+		if !ok {
+			conn.Close()
+			continue
+		}
+		// File() returns a blocking-mode dup of the socket; drop the net.Conn
+		// wrapper and serve the raw fd.
+		f, err := uc.File()
+		uc.Close()
+		if err != nil {
+			continue
+		}
+		s := &server{
+			fd:        int(f.Fd()),
+			backDir:   backDir,
+			nextFh:    1,
+			openFiles: make(map[uint64]*os.File),
+		}
+		go func() {
+			s.serveStream()
+			f.Close()
+		}()
+	}
 }
 
 type server struct {
@@ -69,6 +111,63 @@ func (s *server) serve() {
 			return
 		}
 	}
+}
+
+// serveStream reads length-framed FUSE requests from a SOCK_STREAM connection.
+// Unlike serve (SOCK_SEQPACKET, one message per read), a stream may coalesce or
+// split messages, so requests are reassembled using the FUSEHeaderIn.Len field
+// (the total request size, header included). This matches the Sentry's own
+// stream framer used for runsc-provisioned host-FD mounts.
+func (s *server) serveStream() {
+	var buf []byte
+	tmp := make([]byte, 64*1024)
+	fill := func(need int) bool {
+		for len(buf) < need {
+			n, err := unix.Read(s.fd, tmp)
+			if err != nil || n == 0 {
+				return false
+			}
+			buf = append(buf, tmp[:n]...)
+		}
+		return true
+	}
+	hdrSize := int(linux.SizeOfFUSEHeaderIn)
+	for {
+		if !fill(hdrSize) {
+			return
+		}
+		var hdr linux.FUSEHeaderIn
+		hdr.UnmarshalUnsafe(buf[:hdrSize])
+		frameLen := int(hdr.Len)
+		if frameLen < hdrSize {
+			// Malformed frame; the stream is unrecoverable.
+			return
+		}
+		if !fill(frameLen) {
+			return
+		}
+		payload := buf[hdrSize:frameLen]
+		resp := s.handleRequest(&hdr, payload)
+		buf = buf[frameLen:]
+		if resp == nil {
+			continue
+		}
+		if err := writeAll(s.fd, resp); err != nil {
+			return
+		}
+	}
+}
+
+// writeAll writes all of b to fd, tolerating short writes on a stream socket.
+func writeAll(fd int, b []byte) error {
+	for len(b) > 0 {
+		n, err := unix.Write(fd, b)
+		if err != nil {
+			return err
+		}
+		b = b[n:]
+	}
+	return nil
 }
 
 func (s *server) handleRequest(hdr *linux.FUSEHeaderIn, payload []byte) []byte {

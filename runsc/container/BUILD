@@ -51,6 +51,7 @@ go_test(
     srcs = [
         "console_test.go",
         "container_test.go",
+        "fuse_host_test.go",
         "metric_server_test.go",
         "multi_container_test.go",
         "shared_volume_test.go",
@@ -69,6 +70,7 @@ go_test(
     data = [
         "//runsc",
         "//test/cmd/test_app",
+        "//test/fuse_host/workload",
     ],
     library = ":container",
     shard_count = most_shards,
@@ -98,6 +100,7 @@ go_test(
         "//runsc/flag",
         "//runsc/sandbox",
         "//runsc/specutils",
+        "//test/fuse_host:fusehost",
         "//test/metricclient",
         "@com_github_cenkalti_backoff//:go_default_library",
         "@com_github_creack_pty//:go_default_library",
